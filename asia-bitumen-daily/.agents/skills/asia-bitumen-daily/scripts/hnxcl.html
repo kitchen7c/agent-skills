@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>亚洲沥青每日行情分析报告</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+            color: #333;
+        }
+
+        .download-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+            padding: 12px 24px;
+            background-color: #e3000f;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: background-color 0.3s;
+        }
+
+        .download-btn:hover {
+            background-color: #cc000d;
+        }
+
+        .report-container {
+            width: 900px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            padding: 50px 60px;
+            box-sizing: border-box;
+            position: relative;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            padding-bottom: 20px;
+            border-bottom: 2px solid #f0f0f0;
+            margin-bottom: 30px;
+        }
+
+        .header-left {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .logo-title {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .logo {
+            background-color: #e3000f;
+            color: white;
+            padding: 6px 16px;
+            font-size: 24px;
+            font-style: italic;
+            font-weight: 800;
+            margin-right: 15px;
+            border-radius: 2px;
+            letter-spacing: 1px;
+        }
+
+        .title {
+            font-size: 28px;
+            font-weight: bold;
+            color: #1a1a1a;
+            letter-spacing: 1px;
+        }
+
+        .date {
+            color: #888;
+            font-size: 16px;
+            font-style: italic;
+        }
+
+        .header-right {
+            text-align: right;
+        }
+
+        .contract {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        .price-main {
+            font-size: 48px;
+            font-weight: bold;
+            color: #333;
+            line-height: 1;
+            display: flex;
+            align-items: baseline;
+            justify-content: flex-end;
+        }
+
+        .price-main span {
+            font-size: 20px;
+            margin-left: 8px;
+            color: #888;
+            font-weight: normal;
+        }
+
+        /* Price Strip */
+        .price-strip {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 40px;
+            padding: 0 10px;
+        }
+
+        .price-item {
+            text-align: center;
+        }
+
+        .item-label {
+            color: #888;
+            font-size: 13px;
+            margin-bottom: 12px;
+            font-weight: bold;
+        }
+
+        .item-val {
+            font-size: 28px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        .item-status {
+            color: #888;
+            font-size: 13px;
+        }
+
+        .status-up {
+            color: #e3000f;
+            font-weight: bold;
+        }
+
+        /* Text Sections */
+        .section-title {
+            display: flex;
+            align-items: center;
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            position: relative;
+        }
+        
+        .section-title::before {
+            content: '';
+            position: absolute;
+            left: -15px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 4px;
+            height: 22px;
+            background-color: #e3000f;
+        }
+
+        .section-title .icon {
+            margin-right: 8px;
+            font-size: 24px;
+        }
+
+        .two-cols {
+            display: flex;
+            justify-content: space-between;
+            gap: 40px;
+            margin-bottom: 40px;
+        }
+
+        .col {
+            flex: 1;
+        }
+
+        .text-content {
+            font-size: 14px;
+            line-height: 1.8;
+            color: #444;
+            text-align: justify;
+        }
+
+        .text-content strong {
+            color: #000;
+        }
+
+        /* News Section */
+        .news-section {
+            margin-bottom: 40px;
+        }
+
+        .news-title-wrap {
+            display: flex;
+            align-items: center;
+            background-color: #f5f6f8;
+            padding: 8px 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+
+        .news-title-wrap .icon {
+            font-size: 22px;
+            margin-right: 10px;
+        }
+
+        .news-title-wrap span {
+            font-size: 18px;
+            font-weight: bold;
+            color: #1a1a2e;
+        }
+
+        .news-cards {
+            display: flex;
+            gap: 20px;
+        }
+
+        .news-card {
+            flex: 1;
+            padding: 20px;
+            background: #fff;
+            border: 1px solid #eee;
+            border-top: 3px solid #ccc;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+        }
+
+        .card-red { border-top-color: #e3000f; }
+        .card-red .card-tag { color: #e3000f; }
+        
+        .card-orange { border-top-color: #ff9800; }
+        .card-orange .card-tag { color: #ff9800; }
+        
+        .card-blue { border-top-color: #2196f3; }
+        .card-blue .card-tag { color: #2196f3; }
+
+        .card-tag {
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #000;
+            margin-bottom: 12px;
+        }
+
+        .card-desc {
+            font-size: 12px;
+            color: #666;
+            line-height: 1.6;
+        }
+
+        /* Chart Section */
+        .chart-section {
+            margin-bottom: 40px;
+        }
+
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .chart-legend {
+            display: flex;
+            gap: 20px;
+            font-size: 13px;
+            color: #666;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+        }
+
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            margin-right: 6px;
+        }
+
+        .color-grey { background-color: #dcdcdc; }
+        .color-red { background-color: #e3000f; }
+
+        .chart-area {
+            display: flex;
+            justify-content: space-around;
+            align-items: flex-end;
+            height: 160px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }
+
+        .bar-group {
+            display: flex;
+            align-items: flex-end;
+            gap: 4px;
+            position: relative;
+        }
+
+        .bar {
+            width: 35px;
+            position: relative;
+            border-radius: 2px 2px 0 0;
+        }
+
+        .bar-val {
+            position: absolute;
+            top: -20px;
+            width: 100%;
+            text-align: center;
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        .val-grey { color: #888; }
+        .val-red { color: #e3000f; }
+
+        .bar-bg-grey { background-color: #dcdcdc; }
+        .bar-bg-red { background-color: #e3000f; }
+
+        .x-labels {
+            display: flex;
+            justify-content: space-around;
+            font-size: 13px;
+            font-weight: bold;
+            color: #333;
+        }
+
+        /* Advice and Warning */
+        .advice-warning {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .aw-box {
+            padding: 25px;
+            border-radius: 8px;
+        }
+
+        .box-yellow {
+            background-color: #fcfaf2;
+            border: 1px solid #f6eed6;
+        }
+
+        .box-red {
+            background-color: #fdf5f5;
+            border: 1px solid #f6e6e6;
+        }
+
+        .aw-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+        }
+
+        .aw-title .icon {
+            margin-right: 8px;
+            font-size: 20px;
+        }
+
+        .box-yellow .aw-title { color: #b8860b; }
+        .box-red .aw-title { color: #d32f2f; }
+
+        .aw-item {
+            margin-bottom: 15px;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #444;
+        }
+
+        .aw-item-title {
+            font-weight: bold;
+            color: #000;
+            margin-bottom: 4px;
+            font-size: 14px;
+        }
+
+        .aw-item-desc strong {
+            font-weight: bold;
+            color: #000;
+        }
+
+        /* Deep Forecast */
+        .forecast-section {
+            background-color: #121a2f;
+            border-radius: 8px;
+            padding: 30px;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        .forecast-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 25px;
+            display: flex;
+            align-items: center;
+        }
+
+        .forecast-title .icon {
+            margin-right: 8px;
+            color: #ffca28;
+            font-size: 20px;
+        }
+
+        .forecast-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 30px;
+        }
+
+        .fc-col-title {
+            color: #ffd54f;
+            font-size: 13px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .fc-price {
+            font-size: 32px;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+
+        .fc-desc {
+            font-size: 12px;
+            line-height: 1.5;
+            color: #bbb;
+            margin-bottom: 8px;
+            display: flex;
+        }
+
+        .fc-tag-green {
+            color: #4caf50;
+            font-weight: bold;
+            margin-right: 5px;
+            white-space: nowrap;
+        }
+
+        .fc-tag-red {
+            color: #f44336;
+            font-weight: bold;
+            margin-right: 5px;
+            white-space: nowrap;
+        }
+
+        /* Footer */
+        .footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding-top: 15px;
+            border-top: 1px solid #eee;
+        }
+        
+        .footer-right {
+            display: flex;
+            align-items: center;
+        }
+        
+        .footer-square {
+            width: 8px;
+            height: 8px;
+            background-color: #ccc;
+            margin-left: 8px;
+        }
+
+    </style>
+</head>
+<body>
+
+    <button class="download-btn" data-html2canvas-ignore="true" onclick="download8K()">下载8K图片</button>
+
+    <div class="report-container" id="report-container">
+        
+        <!-- Header -->
+        <div class="header">
+            <div class="header-left">
+                <div class="logo-title">
+                    <div class="logo">argus</div>
+                    <div class="title">亚洲沥青每日行情分析报告</div>
+                </div>
+                <div class="date">2026年3月27日 · 星期五</div>
+            </div>
+            <div class="header-right">
+                <div class="contract">上海主力合约 (BU2606)</div>
+                <div class="price-main">4410<span>nc</span></div>
+            </div>
+        </div>
+
+        <!-- Price Strip -->
+        <div class="price-strip">
+            <div class="price-item">
+                <div class="item-label">FOB 新加坡 (ABX 1)</div>
+                <div class="item-val">$635.0</div>
+                <div class="item-status">持平 (nc)</div>
+            </div>
+            <div class="price-item">
+                <div class="item-label">FOB 韩国 (ABX 2)</div>
+                <div class="item-val">$545.0</div>
+                <div class="item-status">持平 (nc)</div>
+            </div>
+            <div class="price-item">
+                <div class="item-label">FOB 伊朗 (散装)</div>
+                <div class="item-val">$460.0</div>
+                <div class="item-status">持平 (nc)</div>
+            </div>
+            <div class="price-item">
+                <div class="item-label">华东</div>
+                <div class="item-val">xxx</div>
+                <div class="item-status">持平 (nc)</div>
+            </div>
+            <div class="price-item">
+                <div class="item-label">华南</div>
+                <div class="item-val">xxx</div>
+                <div class="item-status">持平 (nc)</div>
+            </div>
+        </div>
+
+        <!-- Text Sections -->
+        <div class="two-cols">
+            <div class="col">
+                <div class="section-title"><span class="icon">📈</span> 市场综述</div>
+                <div class="text-content">
+                    <strong>由于进口商提货标价动力不足，新加坡出口价格维持平稳。</strong>根据 Argus 评估，4月装船货源依然稀缺，卖方报价极少，而东南亚多数进口商并不急于达成交易。韩国市场因中国华东买盘疲软保持静止，当地买家库存充足限制了进口意愿。伊朗散装沥青价格随南亚国内价值区间波动而持平，印度部分地区虽有询价，但成交由于资金匮乏进展缓慢。
+                </div>
+            </div>
+            <div class="col">
+                <div class="section-title"><span class="icon">🚢</span> 交易动态</div>
+                <div class="text-content">
+                    <strong>AOM 平台本交易日表现清淡。</strong>尽管 Trafigura 此前对4月中下旬货源维持 $620/吨的买标，但未能吸引卖方兴趣。市场报出的 4月 FOB 新加坡买卖参考价维持在 $630-640/吨区间。值得注意的是，尽管越南市场有持续询盘，但在新加坡供应受限且报价高企背景下，部分买家已开始转向采购性价比更高的中国南方货源。
+                </div>
+            </div>
+        </div>
+
+        <!-- News Section -->
+        <div class="news-section">
+            <div class="news-title-wrap">
+                <span class="icon">📰</span> <span>行业动态速递 (INDUSTRY NEWS)</span>
+            </div>
+            <div class="news-cards">
+                <div class="news-card card-red">
+                    <div class="card-tag">区域动态</div>
+                    <div class="card-title">东南亚观望情绪浓厚</div>
+                    <div class="card-desc">新加坡报价因减产和不可抗力而持续匮乏。虽然开斋节后活动正缓慢恢复，但印尼和马来西亚买家对目前的高价 FOB 货源持谨慎态度，不愿盲目跟进。</div>
+                </div>
+                <div class="news-card card-orange">
+                    <div class="card-tag">南亚需求</div>
+                    <div class="card-title">印度施工资金承压</div>
+                    <div class="card-desc">印度国内部分地区报价调涨至 69,000 卢比/吨。但实际成交由于承包商缺乏道路工程资金而陷入停滞，需求恢复仍需等待资金流动性改善。</div>
+                </div>
+                <div class="news-card card-blue">
+                    <div class="card-tag">市场通知</div>
+                    <div class="card-title">耶稣受难日提前休市</div>
+                    <div class="card-desc">提醒：由于4月3日新加坡假期，Argus 评估将于4月2日（周四）中午 12:30 提前截止。请市场参与者务必注意交易与反馈的时间窗口调整。</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chart Section -->
+        <div class="chart-section">
+            <div class="section-title" style="margin-bottom: 0;">主要 FOB 评估价格对比 (USD/t)</div>
+            <div class="chart-header">
+                <div style="width: 10px;"></div>
+                <div class="chart-legend">
+                    <div class="legend-item"><div class="legend-color color-grey"></div> 3月26日</div>
+                    <div class="legend-item"><div class="legend-color color-red"></div> 3月27日</div>
+                </div>
+            </div>
+            <div class="chart-area">
+                <div class="bar-group">
+                    <div class="bar bar-bg-grey" style="height: 120px;">
+                        <div class="bar-val val-grey">635</div>
+                    </div>
+                    <div class="bar bar-bg-red" style="height: 120px;">
+                        <div class="bar-val val-red">635</div>
+                    </div>
+                </div>
+                <div class="bar-group">
+                    <div class="bar bar-bg-grey" style="height: 103px;">
+                        <div class="bar-val val-grey">545</div>
+                    </div>
+                    <div class="bar bar-bg-red" style="height: 103px;">
+                        <div class="bar-val val-red">545</div>
+                    </div>
+                </div>
+                <div class="bar-group">
+                    <div class="bar bar-bg-grey" style="height: 87px;">
+                        <div class="bar-val val-grey">460</div>
+                    </div>
+                    <div class="bar bar-bg-red" style="height: 87px;">
+                        <div class="bar-val val-red">460</div>
+                    </div>
+                </div>
+            </div>
+            <div class="x-labels">
+                <div>新加坡 ABX 1</div>
+                <div>韩国离岸价</div>
+                <div>伊朗散装价</div>
+            </div>
+        </div>
+
+        <!-- Advice and Warning -->
+        <div class="advice-warning">
+            <div class="aw-box box-yellow">
+                <div class="aw-title"><span class="icon">💡</span> 核心建议 (STRATEGIC ADVICE)</div>
+                <div class="aw-item">
+                    <div class="aw-item-title">1. 利用华南溢价进行货源置换</div>
+                    <div class="aw-item-desc">华南现货价格近日偏强，<strong>上涨至 4530元/吨</strong>，且正值越南转向中国采购的窗口期。建议华南厂家优先匹配出口订单以锁定更高利润。</div>
+                </div>
+                <div class="aw-item">
+                    <div class="aw-item-title">2. 应对新加坡“供应真空”</div>
+                    <div class="aw-item-desc">由于4月新加坡合同大量取消，依赖该渠道的买家应<strong>迅速切换至韩国或中国货源</strong>，不要盲目等待新加坡复产，目前不可抗力恢复时间尚不明确。</div>
+                </div>
+                <div class="aw-item">
+                    <div class="aw-item-title">3. 华东市场：保持去库节奏</div>
+                    <div class="aw-item-desc">华东价格虽持稳在 4540元/吨，但库存仍是制约进口需求的主要因素。<strong>建议华东贸易商趁行情相对坚挺积极出货</strong>，避免后期进口货涌入带来的竞争压力。</div>
+                </div>
+            </div>
+            
+            <div class="aw-box box-red">
+                <div class="aw-title"><span class="icon">⚠️</span> 风险提示 (RISK WARNING)</div>
+                <div class="aw-item">
+                    <div class="aw-item-title">1. 需求端：资金断裂导致消费疲软</div>
+                    <div class="aw-item-desc">南亚市场（特别是印度）已出现由于<strong>承包商缺乏资金</strong>而导致的施工停滞。需警惕此类资金风险向东南亚蔓延，导致成交量长期萎缩。</div>
+                </div>
+                <div class="aw-item">
+                    <div class="aw-item-title">2. 供应端：新加坡出口份额调整</div>
+                    <div class="aw-item-desc">一旦新加坡主要炼厂恢复 VB 供应并释放出口份额，目前的 FOB 溢价可能会<strong>迅速被抹平</strong>。目前的强势主要是基于绝对供应短缺而非需求激增。</div>
+                </div>
+                <div class="aw-item">
+                    <div class="aw-item-title">3. 地缘因素：伊朗货源的波动</div>
+                    <div class="aw-item-desc">伊朗散装沥青价格目前相对处于低位，需关注由于国际局势变动引发的<strong>运费飙升风险</strong>，这可能抵消伊朗货源的成本优势。</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Deep Forecast -->
+        <div class="forecast-section">
+            <div class="forecast-title"><span class="icon">⚡</span> 趋势预测 (DEEP FORECAST)</div>
+            <div class="forecast-grid">
+                <div>
+                    <div class="fc-col-title">新加坡 (ABX 1)</div>
+                    <div class="fc-price">$635 - $645</div>
+                    <div class="fc-desc"><span class="fc-tag-green">支撑:</span> 极度稀缺的现货供应及卖方惜售心态。</div>
+                    <div class="fc-desc"><span class="fc-tag-red">阻力:</span> 进口商抵制高价及转向中国货源的趋势。</div>
+                </div>
+                <div>
+                    <div class="fc-col-title">韩国离岸 (ABX 2)</div>
+                    <div class="fc-price">$540 - $555</div>
+                    <div class="fc-desc"><span class="fc-tag-green">支撑:</span> 其他区域合同取消引来跨区域性紧缩效应。</div>
+                    <div class="fc-desc"><span class="fc-tag-red">阻力:</span> 中国主力合约价格波动及华东进口疲软。</div>
+                </div>
+                <div>
+                    <div class="fc-col-title">伊朗离岸 (FOB)</div>
+                    <div class="fc-price">$450 - $490</div>
+                    <div class="fc-desc"><span class="fc-tag-green">支撑:</span> xxxxxxxx。</div>
+                    <div class="fc-desc"><span class="fc-tag-red">阻力:</span> xxxxxxx。</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <div>ARGUS MEDIA INTELLIGENCE - ASIA BITUMEN SECTOR</div>
+            <div class="footer-right">
+                数据来源: ARGUS 实时评估 2026-03-27 <div class="footer-square"></div>
+            </div>
+        </div>
+        
+    </div>
+
+    <script>
+        function download8K() {
+            const container = document.getElementById('report-container');
+            
+            // Set scale to 8 for 8K-like quality (8 times the container width)
+            // Original width 900px * 8 = 7200px (close to 8K resolution 7680x4320)
+            html2canvas(container, {
+                scale: 8,
+                useCORS: true,
+                backgroundColor: '#ffffff',
+                logging: false
+            }).then(canvas => {
+                const link = document.createElement('a');
+                link.download = 'argus_report_8k.png';
+                link.href = canvas.toDataURL('image/png', 1.0);
+                link.click();
+            }).catch(err => {
+                console.error("生成图片失败: ", err);
+                alert("生成图片失败，请重试！");
+            });
+        }
+    </script>
+</body>
+</html>

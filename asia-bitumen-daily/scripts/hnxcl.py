@@ -2,6 +2,8 @@ import os
 import argparse
 import requests
 import json
+import base64
+import mimetypes
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import fitz  # PyMuPDF，用于读取PDF内容
@@ -63,10 +65,33 @@ def resolve_chinese_font_paths(font_dir=DEFAULT_FONT_DIR):
     return resolved
 
 
+def font_source_to_css_url(font_source):
+    """把本地字体文件转换成可嵌入 CSS 的 data URL。"""
+    if not font_source:
+        return None
+    if str(font_source).startswith("data:"):
+        return str(font_source)
+
+    if str(font_source).startswith("file://"):
+        font_path = Path(font_source.removeprefix("file://"))
+    else:
+        font_path = Path(font_source)
+
+    font_bytes = font_path.read_bytes()
+    mime_type, _ = mimetypes.guess_type(font_path.name)
+    if not mime_type:
+        suffix = font_path.suffix.lower()
+        mime_type = "font/otf" if suffix == ".otf" else "font/ttf"
+
+    encoded = base64.b64encode(font_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
 def build_embedded_font_css(font_sources):
     """构造 PDF 打印专用字体 CSS，优先使用项目内置字体。"""
     font_faces = []
     if font_sources.get("regular"):
+        regular_src = font_source_to_css_url(font_sources["regular"])
         font_faces.append(
             "\n".join(
                 [
@@ -75,13 +100,14 @@ def build_embedded_font_css(font_sources):
                     "    font-style: normal;",
                     "    font-weight: 400;",
                     "    font-display: swap;",
-                    f'    src: url("{font_sources["regular"]}") format("truetype");',
+                    f'    src: url("{regular_src}");',
                     "}",
                 ]
             )
         )
 
     if font_sources.get("bold"):
+        bold_src = font_source_to_css_url(font_sources["bold"])
         font_faces.append(
             "\n".join(
                 [
@@ -90,7 +116,7 @@ def build_embedded_font_css(font_sources):
                     "    font-style: normal;",
                     "    font-weight: 700;",
                     "    font-display: swap;",
-                    f'    src: url("{font_sources["bold"]}") format("truetype");',
+                    f'    src: url("{bold_src}");',
                     "}",
                 ]
             )

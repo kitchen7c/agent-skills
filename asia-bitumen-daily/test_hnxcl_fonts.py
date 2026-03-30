@@ -4,6 +4,7 @@ from pathlib import Path
 
 from scripts.hnxcl import (
     build_embedded_font_css,
+    font_source_to_css_url,
     inject_pdf_font_styles,
     prepare_output_path,
     resolve_chinese_font_paths,
@@ -12,18 +13,30 @@ from scripts.hnxcl import (
 
 class HnxclFontTests(unittest.TestCase):
     def test_build_embedded_font_css_includes_font_faces_and_family_stack(self):
-        css = build_embedded_font_css(
-            {
-                "regular": "file:///tmp/NotoSansSC-Regular.ttf",
-                "bold": "file:///tmp/NotoSansSC-Bold.ttf",
-            }
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            regular = Path(tmpdir) / "NotoSansSC-Regular.ttf"
+            bold = Path(tmpdir) / "NotoSansSC-Bold.ttf"
+            regular.write_bytes(b"regular-font-bytes")
+            bold.write_bytes(b"bold-font-bytes")
+
+            css = build_embedded_font_css(
+                {"regular": regular.resolve().as_uri(), "bold": bold.resolve().as_uri()}
+            )
 
         self.assertIn("@font-face", css)
         self.assertIn("Noto Sans SC Embedded", css)
-        self.assertIn("file:///tmp/NotoSansSC-Regular.ttf", css)
-        self.assertIn("file:///tmp/NotoSansSC-Bold.ttf", css)
+        self.assertIn("data:font/ttf;base64,", css)
         self.assertIn("Noto Sans SC", css)
+
+    def test_font_source_to_css_url_embeds_local_file_as_data_uri(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            font_path = Path(tmpdir) / "NotoSansSC-Regular.ttf"
+            font_path.write_bytes(b"regular-font-bytes")
+
+            css_url = font_source_to_css_url(font_path.resolve().as_uri())
+
+        self.assertTrue(css_url.startswith("data:font/ttf;base64,"))
+        self.assertNotIn("file://", css_url)
 
     def test_inject_pdf_font_styles_inserts_style_before_head_close(self):
         html = "<html><head><title>x</title></head><body>中文</body></html>"

@@ -2,9 +2,32 @@ import os
 import argparse
 import requests
 import json
+from pathlib import Path
 from playwright.sync_api import sync_playwright
 import fitz  # PyMuPDF，用于读取PDF内容
 from openai import OpenAI  # 用于调用大模型
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_FONT_DIR = PROJECT_ROOT / "assets" / "fonts"
+FONT_FILE_CANDIDATES = {
+    "regular": (
+        "NotoSansSC-Regular.ttf",
+        "NotoSansCJKsc-Regular.otf",
+        "SourceHanSansSC-Regular.otf",
+    ),
+    "bold": (
+        "NotoSansSC-Bold.ttf",
+        "NotoSansCJKsc-Bold.otf",
+        "SourceHanSansSC-Bold.otf",
+    ),
+}
+FALLBACK_FONT_STACK = (
+    '"Noto Sans SC Embedded", "Noto Sans SC", "Noto Sans CJK SC", '
+    '"Source Han Sans SC", "WenQuanYi Zen Hei", "PingFang SC", '
+    '"Microsoft YaHei", sans-serif'
+)
 
 
 def ensure_output_dir(output_dir):
@@ -14,6 +37,78 @@ def ensure_output_dir(output_dir):
     normalized_dir = os.path.abspath(os.path.expanduser(output_dir))
     os.makedirs(normalized_dir, exist_ok=True)
     return normalized_dir
+
+
+def resolve_chinese_font_paths(font_dir=DEFAULT_FONT_DIR):
+    """返回可嵌入 PDF HTML 的中文字体 URI。"""
+    font_dir = Path(font_dir)
+    resolved = {}
+
+    for weight, candidates in FONT_FILE_CANDIDATES.items():
+        for candidate in candidates:
+            font_path = font_dir / candidate
+            if font_path.exists():
+                resolved[weight] = font_path.resolve().as_uri()
+                break
+
+    return resolved
+
+
+def build_embedded_font_css(font_sources):
+    """构造 PDF 打印专用字体 CSS，优先使用项目内置字体。"""
+    font_faces = []
+    if font_sources.get("regular"):
+        font_faces.append(
+            "\n".join(
+                [
+                    "@font-face {",
+                    '    font-family: "Noto Sans SC Embedded";',
+                    "    font-style: normal;",
+                    "    font-weight: 400;",
+                    "    font-display: swap;",
+                    f'    src: url("{font_sources["regular"]}") format("truetype");',
+                    "}",
+                ]
+            )
+        )
+
+    if font_sources.get("bold"):
+        font_faces.append(
+            "\n".join(
+                [
+                    "@font-face {",
+                    '    font-family: "Noto Sans SC Embedded";',
+                    "    font-style: normal;",
+                    "    font-weight: 700;",
+                    "    font-display: swap;",
+                    f'    src: url("{font_sources["bold"]}") format("truetype");',
+                    "}",
+                ]
+            )
+        )
+
+    font_faces.append(
+        "\n".join(
+            [
+                "html, body, button, input, textarea, select, table, div, span, p, li, td, th {",
+                f"    font-family: {FALLBACK_FONT_STACK};",
+                "}",
+                "strong, b, h1, h2, h3, h4, h5, h6 {",
+                f"    font-family: {FALLBACK_FONT_STACK};",
+                "}",
+            ]
+        )
+    )
+
+    return "\n\n".join(font_faces)
+
+
+def inject_pdf_font_styles(html_content, font_css):
+    """把 PDF 打印用的字体样式注入到 HTML 中。"""
+    style_tag = f"\n<style id=\"pdf-font-fallbacks\">\n{font_css}\n</style>\n"
+    if "</head>" in html_content:
+        return html_content.replace("</head>", f"{style_tag}</head>", 1)
+    return f"{style_tag}{html_content}"
 
 
 def send_pdf_to_dingtalk(file_path, target_user_id='18669'):
@@ -249,6 +344,16 @@ class ArgusDownloader:
             if new_html_content.endswith("```"):
                 new_html_content = new_html_content[:-3]
                 
+            # 为 PDF 打印阶段显式注入中文字体，避免 Linux 服务器缺少系统字体导致乱码
+            embedded_fonts = resolve_chinese_font_paths()
+            font_css = build_embedded_font_css(embedded_fonts)
+            new_html_content = inject_pdf_font_styles(new_html_content.strip(), font_css)
+
+            if embedded_fonts:
+                print(f"-> 已注入内置中文字体: {', '.join(sorted(embedded_fonts.keys()))}")
+            else:
+                print("-> 未找到内置中文字体文件，将依赖系统字体回退链")
+
             base_name = os.path.splitext(os.path.basename(pdf_path))[0]
             new_html_path = os.path.join(os.path.dirname(pdf_path), f"{base_name}_zh.html")
             
@@ -263,9 +368,10 @@ class ArgusDownloader:
             temp_browser = self.p.chromium.launch(headless=True)
             temp_page = temp_browser.new_page()
             
-            temp_page.goto(f"file://{new_html_path}")
-            # 等待页面上的字体和DOM加载完毕
-            temp_page.wait_for_load_state("networkidle")
+            temp_page.goto(Path(new_html_path).resolve().as_uri())
+            temp_page.wait_for_load_state("domcontentloaded")
+            # 等待页面字体真正完成加载，避免打印时仍在字体回退阶段
+            temp_page.wait_for_function("() => document.fonts && document.fonts.status === 'loaded'")
             
             # 导出为 PDF (A4纸尺寸，包含背景色)
             temp_page.pdf(path=new_pdf_path, format="A4", print_background=True)

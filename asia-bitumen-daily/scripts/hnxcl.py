@@ -39,6 +39,15 @@ def ensure_output_dir(output_dir):
     return normalized_dir
 
 
+def prepare_output_path(path_like):
+    """确保输出目录存在，并显式删除旧文件以保证覆盖。"""
+    output_path = Path(path_like)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    return output_path
+
+
 def resolve_chinese_font_paths(font_dir=DEFAULT_FONT_DIR):
     """返回可嵌入 PDF HTML 的中文字体 URI。"""
     font_dir = Path(font_dir)
@@ -259,8 +268,8 @@ class ArgusDownloader:
         # 5. 保存文件到目标目录；未指定时回退到当前路径
         file_name = download.suggested_filename
         target_dir = self.output_dir or os.getcwd()
-        download_path = os.path.join(target_dir, file_name)
-        download.save_as(download_path)
+        download_path = prepare_output_path(os.path.join(target_dir, file_name))
+        download.save_as(str(download_path))
 
         print(f"『Argus Asia Bitumen Daily』下载完成！文件已保存至: {download_path}")
 
@@ -376,8 +385,8 @@ class ArgusDownloader:
                 print("-> 未找到内置中文字体文件，将依赖系统字体回退链")
 
             base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-            new_html_path = os.path.join(
-                os.path.dirname(pdf_path), f"{base_name}_zh.html"
+            new_html_path = prepare_output_path(
+                os.path.join(os.path.dirname(pdf_path), f"{base_name}_zh.html")
             )
 
             with open(new_html_path, "w", encoding="utf-8") as f:
@@ -385,8 +394,8 @@ class ArgusDownloader:
             print(f"-> 中文版 HTML 生成成功，已保存至: {new_html_path}")
 
             print("4. 正在使用 Playwright 将 HTML 转换为 PDF...")
-            new_pdf_path = os.path.join(
-                os.path.dirname(pdf_path), f"{base_name}_zh.pdf"
+            new_pdf_path = prepare_output_path(
+                os.path.join(os.path.dirname(pdf_path), f"{base_name}_zh.pdf")
             )
 
             # 使用临时的无头浏览器上下文进行 PDF 打印 (因为有头模式不支持 page.pdf)
@@ -401,7 +410,7 @@ class ArgusDownloader:
             )
 
             # 导出为 PDF (A4纸尺寸，包含背景色)
-            temp_page.pdf(path=new_pdf_path, format="A4", print_background=True)
+            temp_page.pdf(path=str(new_pdf_path), format="A4", print_background=True)
             temp_browser.close()
 
             print(f"-> 中文版 PDF 生成成功，已保存至: {new_pdf_path}")

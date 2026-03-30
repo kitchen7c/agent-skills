@@ -2,7 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.hnxcl import build_embedded_font_css, inject_pdf_font_styles, resolve_chinese_font_paths
+from scripts.hnxcl import (
+    build_embedded_font_css,
+    inject_pdf_font_styles,
+    prepare_output_path,
+    resolve_chinese_font_paths,
+)
 
 
 class HnxclFontTests(unittest.TestCase):
@@ -41,6 +46,25 @@ class HnxclFontTests(unittest.TestCase):
 
             self.assertEqual(resolved["regular"], regular.resolve().as_uri())
             self.assertEqual(resolved["bold"], bold.resolve().as_uri())
+
+    def test_prepare_output_path_removes_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "existing.html"
+            target.write_text("old", encoding="utf-8")
+
+            prepared = prepare_output_path(target)
+
+            self.assertEqual(prepared, target)
+            self.assertFalse(target.exists())
+
+    def test_prepare_output_path_creates_missing_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "nested" / "report.pdf"
+
+            prepared = prepare_output_path(target)
+
+            self.assertEqual(prepared, target)
+            self.assertTrue(target.parent.exists())
 
 
 if __name__ == "__main__":

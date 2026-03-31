@@ -200,6 +200,17 @@ def inject_pdf_font_styles(html_content, font_css):
     return f"{style_tag}{html_content}"
 
 
+def remove_pdf_ignored_elements(html_content):
+    """移除只应保留在交互页面中的节点，例如下载按钮。"""
+    html_content = re.sub(
+        r'\s*<button class="download-btn"[^>]*?>.*?</button>\s*',
+        "\n",
+        html_content,
+        flags=re.DOTALL,
+    )
+    return html_content
+
+
 def extract_json_payload(response_text):
     """从模型输出中提取 JSON 对象。"""
     cleaned = response_text.strip()
@@ -736,6 +747,7 @@ JSON schema:
             new_html_content = inject_pdf_font_styles(
                 new_html_content.strip(), font_css
             )
+            new_html_content = remove_pdf_ignored_elements(new_html_content)
 
             if embedded_fonts:
                 print(

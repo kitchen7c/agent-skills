@@ -178,6 +178,26 @@
         .section-title .icon {
             margin-right: 8px;
             font-size: 24px;
+            width: 24px;
+            height: 24px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: currentColor;
+        }
+
+        .section-title .icon svg,
+        .news-title-wrap .icon svg,
+        .aw-title .icon svg,
+        .forecast-title .icon svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+            stroke: currentColor;
+            fill: none;
+            stroke-width: 1.8;
+            stroke-linecap: round;
+            stroke-linejoin: round;
         }
 
         .two-cols {
@@ -219,6 +239,11 @@
         .news-title-wrap .icon {
             font-size: 22px;
             margin-right: 10px;
+            width: 22px;
+            height: 22px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .news-title-wrap span {
@@ -383,6 +408,11 @@
         .aw-title .icon {
             margin-right: 8px;
             font-size: 20px;
+            width: 20px;
+            height: 20px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .box-yellow .aw-title { color: #b8860b; }
@@ -428,6 +458,11 @@
             margin-right: 8px;
             color: #ffca28;
             font-size: 20px;
+            width: 20px;
+            height: 20px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .forecast-grid {
@@ -529,11 +564,11 @@
         <!-- Text Sections -->
         <div class="two-cols">
             <div class="col">
-                <div class="section-title"><span class="icon">📈</span> 市场综述</div>
+                <div class="section-title"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 19V5"></path><path d="M4 19H20"></path><path d="M7 15L11 11L14 14L20 8"></path></svg></span> 市场综述</div>
                 <div class="text-content">{{MARKET_SUMMARY_HTML}}</div>
             </div>
             <div class="col">
-                <div class="section-title"><span class="icon">🚢</span> 交易动态</div>
+                <div class="section-title"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 16L7 14H17L21 16"></path><path d="M6 14V10H14V14"></path><path d="M9 10V7H12L14 10"></path><path d="M3 18C4.5 19.5 6 19.5 7.5 18C9 19.5 10.5 19.5 12 18C13.5 19.5 15 19.5 16.5 18C18 19.5 19.5 19.5 21 18"></path></svg></span> 交易动态</div>
                 <div class="text-content">{{TRADE_DYNAMICS_HTML}}</div>
             </div>
         </div>
@@ -541,7 +576,7 @@
         <!-- News Section -->
         <div class="news-section">
             <div class="news-title-wrap">
-                <span class="icon">📰</span> <span>行业动态速递 (INDUSTRY NEWS)</span>
+                <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 6H19V18H5Z"></path><path d="M8 10H16"></path><path d="M8 13H16"></path><path d="M8 16H13"></path><path d="M5 8L8 8"></path></svg></span> <span>行业动态速递 (INDUSTRY NEWS)</span>
             </div>
             <div class="news-cards">{{NEWS_CARDS}}</div>
         </div>
@@ -563,19 +598,19 @@
         <!-- Advice and Warning -->
         <div class="advice-warning">
             <div class="aw-box box-yellow">
-                <div class="aw-title"><span class="icon">💡</span> 核心建议 (STRATEGIC ADVICE)</div>
+                <div class="aw-title"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 18H15"></path><path d="M10 22H14"></path><path d="M8 14C6.8 13 6 11.5 6 10C6 6.7 8.7 4 12 4C15.3 4 18 6.7 18 10C18 11.5 17.2 13 16 14C15.3 14.6 15 15.2 15 16H9C9 15.2 8.7 14.6 8 14Z"></path></svg></span> 核心建议 (STRATEGIC ADVICE)</div>
                 {{ADVICE_ITEMS}}
             </div>
             
             <div class="aw-box box-red">
-                <div class="aw-title"><span class="icon">⚠️</span> 风险提示 (RISK WARNING)</div>
+                <div class="aw-title"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 4L21 20H3Z"></path><path d="M12 9V14"></path><path d="M12 17H12.01"></path></svg></span> 风险提示 (RISK WARNING)</div>
                 {{WARNING_ITEMS}}
             </div>
         </div>
 
         <!-- Deep Forecast -->
         <div class="forecast-section">
-            <div class="forecast-title"><span class="icon">⚡</span> 趋势预测 (DEEP FORECAST)</div>
+            <div class="forecast-title"><span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M13 3L5 14H11L10 21L19 9H13Z"></path></svg></span> 趋势预测 (DEEP FORECAST)</div>
             <div class="forecast-grid">{{FORECAST_COLUMNS}}</div>
         </div>
 

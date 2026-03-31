@@ -43,8 +43,10 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 量化输出的最小输入集如下：
 
 - 主参考标的与对应时间戳
+- 明确的 ICE Brent 合约代码、到期日/最后交易日、roll 规则
 - 明确的到期日或持有期假设
 - 可验证的波动率输入：IV、IV proxy 或 HV
+- 可验证的贴现/无风险利率代理，或明确写明 `r=0 假设`
 - 明确的合约乘数或单位换算
 - 至少一个可复核的价格路径假设或分布假设
 
@@ -56,7 +58,7 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 如果以下任一项缺失：
 
-- Brent M+2 / M+3 / M+4 无法完成双源交叉验证
+- 主交易参考合约无法精确映射到同一 ICE 合约代码与到期日
 - 无法确认使用 Black-76 还是 BSM proxy
 - 无法取得期权链或可验证的 IV / IV proxy
 - 无法实际运行 Python 定量计算
@@ -99,7 +101,7 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 ### 1. 模式闸门
 
-先判断以下两种模式中的哪一种成立：
+先判断以下三种模式中的哪一种成立：
 
 #### Mode A: Black-76 执行模式
 
@@ -109,33 +111,55 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 - 可见 strike
 - 可见 option side
 - 且至少可见 option price 或 implied volatility
+- 且至少可验证 quote type：bid/ask midpoint、settlement，或其他可说明口径
+- 且链路流动性与质量足以支持 72 小时执行研究，而不只是“看得到字段”
+- 且能说明 option contract code、exercise / settlement convention、最小变动价位或其他关键合约规则
 
 如果满足：
 
 - 以 Black-76 为主模型
 - 所有期权定价与 Greeks 统一锚定到同一 Brent futures expiry
 - 行权价优先使用公开可见链路中的真实 strike
+- 必须写明 quote type、时间戳、流动性过滤规则、关键合约规则，以及该 expiry 与 72 小时交易窗口的关系
 
-#### Mode B: BSM 代理模式
+#### Mode B: 代理研究模式
 
 如果无法拿到完整、当前、可用于执行层面分析的 Brent 期货期权链，则必须切到 Mode B。
 
 如果切到 Mode B：
 
-- 使用 BZ=F 或其他可验证的 Brent 现货/结算代理
-- 用 BSM 做理论定价
-- 明确写明这是代理模型研究报告，不是实时链路执行报告
-- 所有行权价都必须标注：`模型化执行位，不代表实时可成交盘口`
+- 优先使用可验证的 Brent futures price proxy，并继续以 Black-76 作为期货期权近似框架
+- 只有在用户明确要求现货期权视角，且你能说明 spot proxy、carry 与贴现来源时，才允许使用 BSM
+- 必须明确写明这是代理模型研究报告，不是实时链路执行报告
+- 所有行权价都必须标注：`模型化执行位，仅用于结构示例，不代表实时可成交盘口`
+- Mode B 默认不输出执行级 theoretical price、净 Greeks 表、99% VaR / 99% CVaR；若必须量化，只能给情景 PnL、区间化敏感性或不可输出项说明
+
+#### Mode C: 现货代理研究模式
+
+仅在以下条件同时满足时才允许使用：
+
+- 用户明确要求现货期权视角
+- spot proxy 可验证
+- carry 或等价贴现假设可验证
+- 你能说明该 spot proxy 与 futures reference 的映射关系
+
+如果切到 Mode C：
+
+- 必须单列写明这是现货代理研究报告，不是期货期权执行报告
+- 必须明确写明 spot proxy、carry、贴现来源、适用边界
+- 默认不输出执行级 theoretical price、净 Greeks 表、99% VaR / 99% CVaR
+- 所有执行价都必须标注：`模型化执行位，仅用于结构示例，不代表实时可成交盘口`
 
 ### 2. 强制数据抓取
 
 在形成预测前，必须主动检索并交叉验证：
 
-- Brent M+2、M+3、M+4 最新价格
-- 每个价格至少来自 2 个公共来源
+- 72 小时主要交易参考的 ICE Brent prompt 合约或最近邻可交易跨期结构
+- 如需引用第二、第三近月，只能作为曲线与展期背景，不应替代 72 小时主交易参考
+- 每个核心价格至少来自 2 个公共来源
 - 精确时间戳、来源名、是 live / last close / settled proxy
-- OVX 最新值与时间戳
-- M+2/M+3/M+4 曲线形态与价差
+- 期货曲线形态与价差，但必须按具体合约代码与到期日对齐
+- OVX 若使用，必须标注为 `WTI vol proxy`
 - Brent 投机/资管仓位代理；若拿不到原生 Brent，则用最接近且可信的定位代理，并标注 `代理指标`
 - 接下来 72 小时的跳跃催化剂：OPEC / EIA / IEA / 库存 / 制裁 / 地缘冲突 / 宏观数据 / 展期 / 节假日 / 周末流动性
 
@@ -143,17 +167,25 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 - 同一合约两个公共价格源若偏差超过 0.30%，必须同时报告两个值，并解释最终采用哪一个以及原因。
 - 若市场休市，必须明确写明使用的是最近收盘价或最近结算代理。
+- 双源校验只能按“同一 ICE 合约代码 + 同一到期日/最后交易日”进行，不得只按 `M+2` 或连续合约标签对齐。
 
 在正式写报告前，必须先输出或先在内部完成一个 `Input Audit`，至少列出：
 
 - 主参考标的
-- 模式判定结果
-- M+2 / M+3 / M+4 双源是否完成
+- 主交易参考合约代码
+- 最后交易日/到期日
+- roll 规则
+- 模式判定结果：Mode A / Mode B / Mode C
+- 若为执行模式：option contract code 与关键合约规则是否已确认
+- 主交易参考合约双源是否完成
 - IV / IV proxy 来源
 - HV 来源与窗口
+- 贴现/无风险利率代理来源、时间戳与口径；若缺失，是否采用 `r=0 假设`
 - 到期日或持有期
 - 合约乘数
+- 报价口径：bid/ask midpoint、settlement、last 或 proxy
 - Python 是否实际运行成功
+- 主交易参考合约为何选该月而非更近/更远月
 
 若 `Input Audit` 有任一项为空，直接触发降级，不得继续产出伪精确量化结果。
 
@@ -169,17 +201,21 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 如果 Python 可用：
 
-- 使用 ACT/365
-- HV 优先用 20 日日对数收益率；没有则退化到 10 日
+- 必须明确 discount day count 与波动率年化口径；若无法验证，再说明是否采用 ACT/365 作为近似
+- HV 必须尽量向 72 小时持有期对齐；若只能使用更长窗口，必须说明缩放方法与局限
 - Monte Carlo 路径数不少于 100,000
 - 量化输出必须同时支持期权结构与期货情景阶梯
 
-只有在“Python 实际运行成功 + 输入审计通过”同时满足时，才允许：
+只有在“Mode A | 执行模式 + Python 实际运行成功 + 输入审计通过”同时满足时，才允许：
 
 - 输出具体 Greeks 数值
 - 输出具体 99% VaR / 99% CVaR
 - 输出基于模拟的 HDI 概率与尾部区间概率
 - 输出理论期权价格与净权利金
+
+若持有期为 72 小时且期权到期日晚于 72 小时，风险与 PnL 口径必须基于 `t -> t+72h revaluation`，而不是直接用到期 payoff 代替。
+
+只有在 `expiry <= 72h` 时，才允许把持有到期口径作为主口径。
 
 ### 4. 波动率框架
 
@@ -187,13 +223,14 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 - HV
 - IV 或 IV proxy
-- VRP = IV - HV
+- VRP，优先使用同期限、同年化基准下的方差口径；若仅能给 vol point spread，必须注明其局限
 
 解释规则：
 
 - 如果 IV 明显高于 HV，只有在事件风险不极端时，才可以考虑定义风险的卖波动结构
 - 即使 IV 显著高于 HV，也不能把短波动写成“安全”
 - 如果事件跳空风险主导，优先有限损失结构
+- 不得把 OVX 直接当作 Brent 原生 IV；若使用，只能作为 `WTI vol proxy`
 
 ### 5. 微观结构与交易逻辑
 
@@ -225,8 +262,8 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 - 1 个波动率感知的窄战术区间
 - 至少 1 个 HDI 区间，建议给 50% / 68% / 80%
-- 68% 置信区间
-- 95% 置信区间
+- 68% 预测区间
+- 95% 预测区间
 
 区间命名规则：
 
@@ -235,6 +272,13 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 - 如果使用固定宽度窄区间，必须解释该宽度为什么在当前价格与波动 regime 下有决策意义
 
 必须显式说明：原油分布存在非对称肥尾，上行地缘供给冲击与下行需求走弱并不对称，因此正态扩散假设对尾部可靠性有限。
+
+所有概率、HDI、预测区间都必须写成：
+
+- `模型条件概率`
+- `模型条件区间`
+
+并在同段落写明关键假设：分布、波动率输入、是否包含跳跃、持有期、是否按持有到期处理。
 
 ### 7. 策略选择
 
@@ -246,18 +290,21 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 策略选择规则：
 
-- 若 M+2 / M+3 / M+4 存在显著 backwardation 或 contango，必须评估 calendar spread / curve trade 是否更合适
+- 若 prompt 合约与最近邻合约存在显著 backwardation 或 contango，必须评估 calendar spread / curve trade 是否更合适
 - 若 IV 相对 HV 偏贵且事件风险可控，可考虑定义风险卖波动
 - 若跳跃风险占优，应优先有限风险结构
 - 不要推荐裸卖无限风险结构
+- 首选结构必须能在未来 72 小时内具备现实的进入、持有与退出路径；若依赖更长周期展期，必须明确标为中期结构，不得伪装成 72 小时执行框架
+- 只有当交易 thesis 本身由 curve move 主导，且相关 spread 在未来 72 小时内具备现实成交与退出路径时，才允许把 calendar spread 设为首选
 
 期货部分必须明确：
 
-- 使用的具体合约或跨期价差
+- 使用的具体 ICE 合约或跨期价差
 - 入场区
 - 失效位
 - 目标位
 - 每张合约关键价格下的盈亏阶梯
+- 72 小时内的主要保证金/风险资本占用提示（若公开源不可得，则写 `公开源不可得`）
 
 期权部分必须明确：
 
@@ -267,7 +314,17 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 - break-even
 - max profit
 - max loss
-- estimated probability of profit
+
+若以下条件同时满足，才允许追加：
+
+- `estimated probability of profit`
+
+其前提是：
+
+- 持有期已明确
+- 退出规则已明确
+- 成本口径已明确
+- 分布假设已明确
 
 如果用户没有提供真实持仓，所有策略风险指标默认只能对应：
 
@@ -279,7 +336,7 @@ description: Use when the user asks for a 24-96 hour Brent crude tactical report
 
 Mode B 下必须追加一句：
 
-`以上执行价为模型化执行位，不代表实时可成交盘口`
+`以上执行价为模型化执行位，仅用于结构示例，不代表实时可成交盘口`
 
 ### 8. 一致性自检
 
@@ -289,10 +346,11 @@ Mode B 下必须追加一句：
 - 到期日与 day count 是否一致
 - 合约乘数是否一致
 - 有界风险结构的 max loss 是否与结构几何一致
-- 99% VaR / 99% CVaR 绝对值不能超过理论 max loss
-- 压力测试损益不能与 max loss 冲突
+- 只有在结构存在严格有限最大损失时，才检查 VaR / CVaR 与理论 max loss 是否一致
+- 若结构含 futures 或未封顶风险，不得使用 max loss 作为 VaR / CVaR 上限
+- 压力测试损益不能与结构定义、持有期和保证金逻辑冲突
 - 期货 PnL ladder 是否与合约乘数一致
-- 窄区间措辞是否与真实概率一致
+- 窄区间措辞是否与模型条件概率一致
 - 是否误把未验证的 gamma / dealer / OI 结论写成事实
 
 如果任何一项不通过，先修正，再输出。不要把草稿错误直接留给用户。
@@ -322,16 +380,18 @@ Mode B 下必须追加一句：
 - 明确该区间是真高概率区间还是仅为最高密度窄区间
 - 明确首选期货策略
 - 明确首选期权结构
-- 明确模式：`Black-76 执行模式` 或 `BSM 代理模式`
+- 明确模式：`Mode A | 执行模式`、`Mode B | 代理研究模式`，若使用现货代理 BSM，必须单列为 `Mode C | 现货代理研究模式`
 
 ### 2. 底层数据与时间戳
 
-- 写清 Brent M+2 / M+3 / M+4 的采用价格、时间戳、来源、数据类型
-- 写清 OVX 与时间戳
+- 写清主交易参考 ICE 合约的采用价格、时间戳、来源、数据类型、到期日/最后交易日
+- 若引用更远月，只能作为曲线背景，并写清对应合约代码
+- 若使用 OVX，必须明确其为 `WTI vol proxy` 并写时间戳
 - 写清曲线形态
 - 写清仓位代理
 - 写清 72 小时跳跃催化剂
 - 写清为何选 Mode A 或 Mode B
+- 写清为何选择该主交易参考合约，而不是更近/更远月
 
 ### 3. 交叉验证
 
@@ -342,13 +402,20 @@ Mode B 下必须追加一句：
 - 市场是 panic-priced / fairly priced / complacent 的哪一种
 - 各信号一致还是背离
 
+其中必须明确：
+
+- HV 与 IV 是否已对齐到 72 小时持有期
+- VRP 使用的是方差口径还是 vol point spread
+- 所有结论是否仅为模型条件判断
+- 贴现/无风险利率代理与 day count 口径
+
 ### 4. 72 小时价格预测
 
 - 窄战术区间
-- 该区间真实概率
+- 该区间的模型条件概率
 - 至少一个 HDI
-- 68% 区间
-- 95% 区间
+- 68% 预测区间
+- 95% 预测区间
 - 明确窄区间属于高概率区间还是仅为最高密度窄区间
 
 ### 5. 联合策略
@@ -368,6 +435,8 @@ Mode B 下必须追加一句：
 - 应该持有 / 减仓 / 平仓 / 展期
 - 如果要替换结构，替换成什么
 
+压力情景优先使用事件驱动或与当前 vol regime 一致的幅度；固定百分比压力只能作为补充，不能替代主情景。
+
 ### 7. 逐日交易指令
 
 必须给出明确数字化规则：
@@ -381,13 +450,11 @@ Mode B 下必须追加一句：
 
 ### 8. 量化引擎输出
 
-仅在“输入审计通过且 Python 实际运行成功”时，才必须包含以下表格或结果：
+仅在“Mode A | 执行模式 + 输入审计通过 + Python 实际运行成功”时，才必须包含以下表格或结果：
 
 - 每个期权腿的 markdown 表：leg / strike / theoretical price / assumed IV / side / net premium
 - 组合净 Greeks 表：Delta / Gamma / Theta per day / Vega per 1 vol point
 - 首选期货策略 PnL ladder 表
-- 99% VaR
-- 99% CVaR
 - `+15%` 地缘肥尾冲击压力测试
 - `+10%` 压力测试
 - `-10%` 压力测试
@@ -399,6 +466,16 @@ VaR / CVaR 输出时必须先标明口径：
 - `头寸级风险度量`
 
 其中 `头寸级风险度量` 仅在用户明确提供头寸后允许出现。
+
+VaR / CVaR、HDI、PoP、尾部区间都必须明确写成模型条件结果，不得暗示为客观真实概率。
+
+VaR / CVaR 默认优先输出 95% 或 97.5% 口径。
+
+99% VaR / 99% CVaR 只有在尾部假设、跳跃设定与持有期处理已明确时才允许追加输出；若证据不足，不得把 99% 指标写成必需项。
+
+`estimated probability of profit` 只有在明确持有期、退出规则、成本口径与分布假设后才允许输出；否则只给 break-even 与情景收益。
+
+若当前为 `Mode B | 代理研究模式` 或 `Mode C | 现货代理研究模式`，则默认不输出 theoretical price 表、净 Greeks 表、99% VaR / 99% CVaR；此时量化部分应改写为情景 PnL、风险因子敏感性区间或不可输出项说明。
 
 如果未通过输入审计，`【📊 量化引擎运算与一致性复核结果 | Quantitative Engine Output】` 一节必须改为以下内容：
 
@@ -426,7 +503,7 @@ VaR / CVaR 输出时必须先标明口径：
 ## 建议执行顺序
 
 1. 检查能否访问公开 Brent 期权链，完成模式判定
-2. 抓取 M+2 / M+3 / M+4、OVX、利率代理、仓位代理、事件催化剂
+2. 抓取主交易参考 ICE 合约、相关曲线背景、OVX 代理、利率代理、仓位代理、事件催化剂
 3. 统一主参考标的、到期、乘数、年化规则
 4. 跑 HV / IV / VRP / Monte Carlo / Greeks / 风险指标
 5. 做层级区间与情景分析
@@ -466,6 +543,7 @@ VaR / CVaR 输出时必须先标明口径：
 - `Input Audit` 已通过
 - 定量引擎结果已生成，或已明确降级
 - 风险指标与结构几何一致
+- 若输出执行级 theoretical price / Greeks / 99% VaR / 99% CVaR，当前必须为 `Mode A | 执行模式`
 - 若输出 `头寸级风险度量`，用户头寸已完整提供
 - 全文为简体中文
 - 固定章节完整

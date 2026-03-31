@@ -6,6 +6,7 @@ import base64
 import mimetypes
 import html
 import re
+from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import fitz  # PyMuPDF，用于读取PDF内容
@@ -50,6 +51,34 @@ def prepare_output_path(path_like):
     if output_path.exists():
         output_path.unlink()
     return output_path
+
+
+def filename_matches_target_date(filename, target_yyyymmdd):
+    """判断文件名中是否包含目标日期。"""
+    stem = Path(filename).name
+    compact = target_yyyymmdd
+    dashed = f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
+    month_abbr = datetime.strptime(compact, "%Y%m%d").strftime("%d-%b-%Y")
+
+    lowered = stem.lower()
+    return (
+        compact in stem
+        or dashed in stem
+        or month_abbr.lower() in lowered
+    )
+
+
+def is_current_report_file(file_path, target_yyyymmdd):
+    path = Path(file_path)
+    return path.exists() and path.suffix.lower() == ".pdf" and filename_matches_target_date(
+        path.name, target_yyyymmdd
+    )
+
+
+def compute_single_page_pdf_size(content_width_px, content_height_px, padding_px=80):
+    width = max(900, int(content_width_px) + padding_px)
+    height = max(1200, int(content_height_px) + padding_px)
+    return f"{width}px", f"{height}px"
 
 
 def resolve_chinese_font_paths(font_dir=DEFAULT_FONT_DIR):
@@ -138,30 +167,6 @@ def build_embedded_font_css(font_sources):
     )
 
     return "\n\n".join(font_faces)
-
-
-def validate_embedded_font(page):
-    """确认打印页面中的中文文本实际可使用嵌入字体。"""
-    return page.evaluate(
-        """
-        () => {
-            const probeText = "中文沥青价格测试";
-            const families = Array.from(document.querySelectorAll('body, body *'))
-                .slice(0, 20)
-                .map((el) => window.getComputedStyle(el).fontFamily);
-
-            const fontCheck = document.fonts
-                ? document.fonts.check('16px "Noto Sans SC Embedded"', probeText)
-                : false;
-
-            return {
-                fontCheck,
-                families,
-                bodyFontFamily: window.getComputedStyle(document.body).fontFamily,
-            };
-        }
-        """
-    )
 
 
 def inject_pdf_font_styles(html_content, font_css):
@@ -468,6 +473,27 @@ class ArgusDownloader:
         self.context = None
         self.page = None
 
+    @staticmethod
+    def current_report_date():
+        return datetime.now().strftime("%Y%m%d")
+
+    def find_today_report_download(self, target_date):
+        rows = (
+            self.page.locator("div, li, tr")
+            .filter(has_text="Argus Asia Bitumen Daily")
+            .filter(has_text="PDF")
+        )
+        count = rows.count()
+        for index in range(count - 1, -1, -1):
+            row = rows.nth(index)
+            row_text = row.inner_text()
+            if not filename_matches_target_date(row_text, target_date):
+                continue
+            with self.page.expect_download() as download_info:
+                row.get_by_text("PDF", exact=True).first.click()
+            return download_info.value
+        return None
+
     def start_browser(self):
         """启动浏览器并进行基础设置"""
         self.p = sync_playwright().start()
@@ -516,28 +542,31 @@ class ArgusDownloader:
     def get_asia_bitumen_daily(self):
         """获取亚洲沥青日报 (Argus Asia Bitumen Daily)"""
         print("准备下载: Argus Asia Bitumen Daily")
+        target_date = self.current_report_date()
 
-        # 3. 点击 Publications 页签展开下拉菜单
-        print("正在点击 Publications 页签...")
-        self.page.locator("text=Publications").first.click()
+        download = None
+        for attempt in range(1, 4):
+            print(f"正在尝试获取 {target_date} 的日报，第 {attempt}/3 次...")
+            print("正在点击 Publications 页签...")
+            self.page.locator("text=Publications").first.click()
+            self.page.wait_for_selector("text=Argus Asia Bitumen Daily")
+            download = self.find_today_report_download(target_date)
+            if download:
+                break
+            if attempt < 3:
+                print(f"未找到 {target_date} 的日报，10 分钟后重试...")
+                self.page.wait_for_timeout(10 * 60 * 1000)
+                self.page.reload(wait_until="load")
 
-        # 4. 找到下拉菜单中的对应报告并点击 PDF
-        print("正在查找报告并下载...")
-        self.page.wait_for_selector("text=Argus Asia Bitumen Daily")
-
-        with self.page.expect_download() as download_info:
-            row = (
-                self.page.locator("div, li, tr")
-                .filter(has_text="Argus Asia Bitumen Daily")
-                .filter(has_text="PDF")
-                .last
-            )
-            row.get_by_text("PDF", exact=True).first.click()
-
-        download = download_info.value
+        if not download:
+            raise RuntimeError(f"连续 3 次重试后，仍未找到日期为 {target_date} 的 Argus Asia Bitumen Daily")
 
         # 5. 保存文件到目标目录；未指定时回退到当前路径
         file_name = download.suggested_filename
+        if not filename_matches_target_date(file_name, target_date):
+            raise RuntimeError(
+                f"下载文件名 {file_name} 与目标日期 {target_date} 不一致，已中止后续处理"
+            )
         target_dir = self.output_dir or os.getcwd()
         download_path = prepare_output_path(os.path.join(target_dir, file_name))
         download.save_as(str(download_path))
@@ -548,9 +577,9 @@ class ArgusDownloader:
         prices = self.get_oilchem_asphalt_price()
 
         # 新增功能：将PDF内容配合模板，通过大模型生成中文HTML并转为PDF，并附带价格信息
-        self.generate_chinese_report(download_path, prices)
+        self.generate_chinese_report(download_path, prices, target_date)
 
-    def generate_chinese_report(self, pdf_path, prices=None):
+    def generate_chinese_report(self, pdf_path, prices=None, target_date=None):
         """读取PDF内容，使用大模型翻译并结合HTML模板生成中文版报告，最后转为PDF"""
         print("\n=== 开始生成中文版报告 ===")
         print("1. 正在提取PDF文本内容...")
@@ -717,24 +746,43 @@ JSON schema:
                 "() => document.fonts && document.fonts.status === 'loaded'"
             )
 
-            font_validation = validate_embedded_font(temp_page)
-            print(
-                "-> PDF 字体验证:",
-                json.dumps(font_validation, ensure_ascii=False),
+            pdf_metrics = temp_page.evaluate(
+                """
+                () => {
+                    const container = document.getElementById('report-container') || document.body;
+                    const rect = container.getBoundingClientRect();
+                    return {
+                        width: Math.ceil(rect.width),
+                        height: Math.ceil(container.scrollHeight),
+                    };
+                }
+                """
             )
-            if embedded_fonts and not font_validation.get("fontCheck"):
-                raise RuntimeError(
-                    "嵌入中文字体未在打印页面生效，已中止 PDF 生成以避免输出乱码文件"
-                )
+            pdf_width, pdf_height = compute_single_page_pdf_size(
+                pdf_metrics["width"], pdf_metrics["height"]
+            )
+            print(f"-> 单页 PDF 尺寸: width={pdf_width}, height={pdf_height}")
 
-            # 导出为 PDF (A4纸尺寸，包含背景色)
-            temp_page.pdf(path=str(new_pdf_path), format="A4", print_background=True)
+            # 导出为超长单页 PDF，避免 A4 分页截断
+            temp_page.pdf(
+                path=str(new_pdf_path),
+                width=pdf_width,
+                height=pdf_height,
+                print_background=True,
+                prefer_css_page_size=False,
+                margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
+            )
             temp_browser.close()
 
             print(f"-> 中文版 PDF 生成成功，已保存至: {new_pdf_path}")
 
             # 推送生成的 PDF 给指定用户
-            send_pdf_to_dingtalk(new_pdf_path, self.target_user_id)
+            if target_date and not is_current_report_file(new_pdf_path, target_date):
+                raise RuntimeError(
+                    f"生成的中文版 PDF {new_pdf_path} 不是当前日期 {target_date} 的报告，已中止钉钉发送"
+                )
+
+            send_pdf_to_dingtalk(str(new_pdf_path), self.target_user_id)
 
             print("=== 处理完成 ===\n")
 

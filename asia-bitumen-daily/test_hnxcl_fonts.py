@@ -4,9 +4,12 @@ from pathlib import Path
 
 from scripts.hnxcl import (
     build_embedded_font_css,
+    compute_single_page_pdf_size,
     extract_json_payload,
+    filename_matches_target_date,
     font_source_to_css_url,
     inject_pdf_font_styles,
+    is_current_report_file,
     prepare_output_path,
     render_report_template,
     resolve_chinese_font_paths,
@@ -111,6 +114,43 @@ class HnxclFontTests(unittest.TestCase):
         self.assertIn("华东", rendered)
         self.assertIn("3700", rendered)
         self.assertIn("<strong>强势</strong>", rendered)
+
+    def test_filename_matches_target_date_supports_common_formats(self):
+        self.assertTrue(
+            filename_matches_target_date(
+                "Argus Asia Bitumen Daily 20260331.pdf", "20260331"
+            )
+        )
+        self.assertTrue(
+            filename_matches_target_date(
+                "Argus-Asia-Bitumen-Daily-2026-03-31.pdf", "20260331"
+            )
+        )
+        self.assertTrue(
+            filename_matches_target_date(
+                "Argus Asia Bitumen Daily 31-Mar-2026.pdf", "20260331"
+            )
+        )
+        self.assertFalse(
+            filename_matches_target_date(
+                "Argus Asia Bitumen Daily 20260330.pdf", "20260331"
+            )
+        )
+
+    def test_is_current_report_file_requires_existing_matching_pdf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "Argus Asia Bitumen Daily 20260331_zh.pdf"
+            target.write_bytes(b"pdf")
+
+            self.assertTrue(is_current_report_file(target, "20260331"))
+            self.assertFalse(is_current_report_file(target, "20260330"))
+            self.assertFalse(is_current_report_file(target.with_name("other.pdf"), "20260331"))
+
+    def test_compute_single_page_pdf_size_adds_padding_and_px_units(self):
+        width, height = compute_single_page_pdf_size(900, 2200)
+
+        self.assertEqual(width, "980px")
+        self.assertEqual(height, "2280px")
 
 
 if __name__ == "__main__":

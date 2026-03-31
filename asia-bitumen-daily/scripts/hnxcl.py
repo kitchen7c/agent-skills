@@ -68,6 +68,29 @@ def filename_matches_target_date(filename, target_yyyymmdd):
     )
 
 
+def extract_report_date_from_filename(filename):
+    stem = Path(filename).name
+
+    compact_match = re.search(r"(20\d{6})", stem)
+    if compact_match:
+        return datetime.strptime(compact_match.group(1), "%Y%m%d").strftime("%Y年%m月%d日")
+
+    dashed_match = re.search(r"(20\d{2}-\d{2}-\d{2})", stem)
+    if dashed_match:
+        return datetime.strptime(dashed_match.group(1), "%Y-%m-%d").strftime("%Y年%m月%d日")
+
+    month_match = re.search(r"(\d{2}-[A-Za-z]{3}-20\d{2})", stem)
+    if month_match:
+        return datetime.strptime(month_match.group(1), "%d-%b-%Y").strftime("%Y年%m月%d日")
+
+    return "-"
+
+
+def build_generated_report_stem(current_date_cn):
+    compact = current_date_cn.replace("年", "").replace("月", "").replace("日", "")
+    return f"Argus_Asia_Bitumen_Daily_{compact}"
+
+
 def is_current_report_file(file_path, target_yyyymmdd):
     path = Path(file_path)
     return path.exists() and path.suffix.lower() == ".pdf" and filename_matches_target_date(
@@ -333,6 +356,7 @@ def render_report_template(template_html, report_data):
         "{{WARNING_ITEMS}}": _render_aw_items(report_data.get("warnings", [])),
         "{{FORECAST_COLUMNS}}": _render_forecasts(report_data.get("forecasts", [])),
         "{{FOOTER_DATE}}": html.escape(report_data.get("footer_date", "")),
+        "{{ARGUS_SOURCE_DATE_NOTE}}": html.escape(report_data.get("argus_source_date_note", "")),
     }
 
     rendered = template_html
@@ -393,6 +417,7 @@ def normalize_report_data(report_data, today_date, prices=None):
         "warnings": ensure_items(report_data.get("warnings", []), 3),
         "forecasts": forecasts,
         "footer_date": report_data.get("footer_date", today_date.replace("年", "-").replace("月", "-").replace("日", "")),
+        "argus_source_date_note": report_data.get("argus_source_date_note", ""),
     }
 
 
@@ -542,31 +567,25 @@ class ArgusDownloader:
     def get_asia_bitumen_daily(self):
         """获取亚洲沥青日报 (Argus Asia Bitumen Daily)"""
         print("准备下载: Argus Asia Bitumen Daily")
-        target_date = self.current_report_date()
+        
+        # 3. 点击 Publications 页签展开下拉菜单
+        print("正在点击 Publications 页签...")
+        self.page.locator("text=Publications").first.click()
+        self.page.wait_for_selector("text=Argus Asia Bitumen Daily")
 
-        download = None
-        for attempt in range(1, 4):
-            print(f"正在尝试获取 {target_date} 的日报，第 {attempt}/3 次...")
-            print("正在点击 Publications 页签...")
-            self.page.locator("text=Publications").first.click()
-            self.page.wait_for_selector("text=Argus Asia Bitumen Daily")
-            download = self.find_today_report_download(target_date)
-            if download:
-                break
-            if attempt < 3:
-                print(f"未找到 {target_date} 的日报，10 分钟后重试...")
-                self.page.wait_for_timeout(10 * 60 * 1000)
-                self.page.reload(wait_until="load")
+        with self.page.expect_download() as download_info:
+            row = (
+                self.page.locator("div, li, tr")
+                .filter(has_text="Argus Asia Bitumen Daily")
+                .filter(has_text="PDF")
+                .last
+            )
+            row.get_by_text("PDF", exact=True).first.click()
 
-        if not download:
-            raise RuntimeError(f"连续 3 次重试后，仍未找到日期为 {target_date} 的 Argus Asia Bitumen Daily")
+        download = download_info.value
 
         # 5. 保存文件到目标目录；未指定时回退到当前路径
         file_name = download.suggested_filename
-        if not filename_matches_target_date(file_name, target_date):
-            raise RuntimeError(
-                f"下载文件名 {file_name} 与目标日期 {target_date} 不一致，已中止后续处理"
-            )
         target_dir = self.output_dir or os.getcwd()
         download_path = prepare_output_path(os.path.join(target_dir, file_name))
         download.save_as(str(download_path))
@@ -577,12 +596,13 @@ class ArgusDownloader:
         prices = self.get_oilchem_asphalt_price()
 
         # 新增功能：将PDF内容配合模板，通过大模型生成中文HTML并转为PDF，并附带价格信息
-        self.generate_chinese_report(download_path, prices, target_date)
+        self.generate_chinese_report(download_path, prices)
 
-    def generate_chinese_report(self, pdf_path, prices=None, target_date=None):
+    def generate_chinese_report(self, pdf_path, prices=None):
         """读取PDF内容，使用大模型翻译并结合HTML模板生成中文版报告，最后转为PDF"""
         print("\n=== 开始生成中文版报告 ===")
         print("1. 正在提取PDF文本内容...")
+        source_report_date = extract_report_date_from_filename(os.path.basename(pdf_path))
         try:
             doc = fitz.open(pdf_path)
             pdf_text = ""
@@ -705,6 +725,9 @@ JSON schema:
                 response.choices[0].message.content.strip()
             )
             report_payload = normalize_report_data(report_payload, today_date, prices)
+            report_payload["report_date"] = today_date
+            report_payload["footer_date"] = today_date.replace("年", "-").replace("月", "-").replace("日", "")
+            report_payload["argus_source_date_note"] = f"引用 Argus 日报日期: {source_report_date}"
             new_html_content = render_report_template(html_template, report_payload)
 
             # 为 PDF 打印阶段显式注入中文字体，避免 Linux 服务器缺少系统字体导致乱码
@@ -721,7 +744,7 @@ JSON schema:
             else:
                 print("-> 未找到内置中文字体文件，将依赖系统字体回退链")
 
-            base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+            base_name = build_generated_report_stem(today_date)
             new_html_path = prepare_output_path(
                 os.path.join(os.path.dirname(pdf_path), f"{base_name}_zh.html")
             )
@@ -777,11 +800,6 @@ JSON schema:
             print(f"-> 中文版 PDF 生成成功，已保存至: {new_pdf_path}")
 
             # 推送生成的 PDF 给指定用户
-            if target_date and not is_current_report_file(new_pdf_path, target_date):
-                raise RuntimeError(
-                    f"生成的中文版 PDF {new_pdf_path} 不是当前日期 {target_date} 的报告，已中止钉钉发送"
-                )
-
             send_pdf_to_dingtalk(str(new_pdf_path), self.target_user_id)
 
             print("=== 处理完成 ===\n")

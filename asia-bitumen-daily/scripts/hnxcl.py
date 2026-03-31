@@ -647,7 +647,7 @@ class ArgusDownloader:
 
         print("3. 正在调用大模型提取结构化中文内容 (这可能需要几十秒)...")
         api_key = get_required_env("OPENAI_API_KEY")
-        base_url = get_required_env("OPENAI_BASE_URL")
+        base_url = get_required_env("LLM_BASE_URL")
         model_name = os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite-preview")
 
         try:

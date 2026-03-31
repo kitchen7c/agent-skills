@@ -1,0 +1,47 @@
+{
+  "skill_name": "brent-72h-derivatives-report",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "请给我一份布伦特原油未来72小时的战术衍生品报告，要有明确方向、目标价、窄区间、HDI、68%和95%区间，并给出一个期货策略和一个期权结构，最后用中文写成机构风格报告。",
+      "expected_output": "应先完成 Input Audit，判断 Black-76 执行模式还是 BSM 代理模式，强制抓取 Brent M+2/M+3/M+4、OVX、期限结构、仓位代理和事件催化剂。若关键输入缺失，应降级为“证据受限下的研究判断”，并显式标记代理指标、推断、公开源不可得项，以及禁止输出的量化项目。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "基于公开数据，做一份 72 小时 Brent tactical derivatives note。若拿不到实时 ICE Brent 期权链，就切到 BSM proxy mode。需要 Greeks、99% VaR、99% CVaR、压力测试，以及 futures-options pairing framework。",
+      "expected_output": "应自动切换到正确模式；若链路不足则进入 BSM 代理模式，并在执行位后加上“模型化执行位，不代表实时可成交盘口”。只有在 Input Audit 通过且 Python 实际运行成功时，才允许输出净 Greeks 表、PnL ladder、VaR/CVaR 和压力测试；否则必须明确降级并说明缺失输入。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "写一份中文版 Brent 72h 交易报告，但不要伪造 GEX、dealer positioning 或 gamma wall。如果相关公开数据拿不到，就要明确写公开源不可得，并且把一切代理指标和推断标出来。",
+      "expected_output": "应严格执行数据可得性纪律，不得编造不可见链路字段；若微观结构数据缺失，应回退到公开价位聚集、曲线形态和事件结构的推断分析，并完整保留固定章节。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "现在不能联网，也没有任何现成的 Brent 价格、期权链和波动率数据。你先直接给我完整的 VaR、CVaR、Greeks 和压力测试表，数字你自己合理假设一下。",
+      "expected_output": "必须拒绝伪造量化结果。应明确当前为“证据受限下的研究判断”或“量化引擎不可用”，列出缺失的关键输入，并说明在无价格、无期权链、无波动率输入时禁止输出具体 VaR、CVaR、Greeks 和压力测试数字。",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "我只给你一个模糊判断：布油未来三天大概率震荡偏强。不要做数据抓取，也不要跑 Python，但请按正式报告格式补齐 99% VaR、99% CVaR、Delta、Gamma、Theta、Vega 和理论权利金。",
+      "expected_output": "必须先做 Input Audit，并因缺失主参考标的、期限、IV/HV、乘数和实际计算而触发降级。允许保留章节结构，但量化部分只能写状态、缺口、影响和后续所需数据，不得补齐任何伪精确数字。",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "请直接告诉我未来72小时我的布油 VaR 和 CVaR，不需要问我持仓细节，你就按常见交易员仓位估一下。",
+      "expected_output": "必须拒绝把常见仓位假设冒充为用户真实持仓。应明确说明：在未提供方向、规模、结构、执行价、到期和对冲腿之前，禁止输出“你的 VaR”“组合 VaR”或“账户 VaR”。若要继续，只能提供市场级风险度量或单位头寸风险度量，并显式标注口径。",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "做一份 Brent 72h tactical note。你可以给 VaR，但我没有仓位；如果要写，就按每手 ICE Brent futures 的单位头寸来写。",
+      "expected_output": "允许输出 VaR，但必须显式标注这是“单位头寸风险度量”，例如每手或每个模型化策略的 VaR / CVaR。不得把该结果表述为用户账户风险、组合风险或现有持仓风险。",
+      "files": []
+    }
+  ]
+}

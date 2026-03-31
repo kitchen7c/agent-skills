@@ -368,6 +368,7 @@ def render_report_template(template_html, report_data):
         "{{FORECAST_COLUMNS}}": _render_forecasts(report_data.get("forecasts", [])),
         "{{FOOTER_DATE}}": html.escape(report_data.get("footer_date", "")),
         "{{ARGUS_SOURCE_DATE_NOTE}}": html.escape(report_data.get("argus_source_date_note", "")),
+        "{{ARGUS_SOURCE_FILE}}": html.escape(report_data.get("argus_source_file", "")),
     }
 
     rendered = template_html
@@ -429,6 +430,7 @@ def normalize_report_data(report_data, today_date, prices=None):
         "forecasts": forecasts,
         "footer_date": report_data.get("footer_date", today_date.replace("年", "-").replace("月", "-").replace("日", "")),
         "argus_source_date_note": report_data.get("argus_source_date_note", ""),
+        "argus_source_file": report_data.get("argus_source_file", ""),
     }
 
 
@@ -613,7 +615,8 @@ class ArgusDownloader:
         """读取PDF内容，使用大模型翻译并结合HTML模板生成中文版报告，最后转为PDF"""
         print("\n=== 开始生成中文版报告 ===")
         print("1. 正在提取PDF文本内容...")
-        source_report_date = extract_report_date_from_filename(os.path.basename(pdf_path))
+        source_pdf_name = os.path.basename(pdf_path)
+        source_report_date = extract_report_date_from_filename(source_pdf_name)
         try:
             doc = fitz.open(pdf_path)
             pdf_text = ""
@@ -739,6 +742,7 @@ JSON schema:
             report_payload["report_date"] = today_date
             report_payload["footer_date"] = today_date.replace("年", "-").replace("月", "-").replace("日", "")
             report_payload["argus_source_date_note"] = f"引用 Argus 日报日期: {source_report_date}"
+            report_payload["argus_source_file"] = source_pdf_name
             new_html_content = render_report_template(html_template, report_payload)
 
             # 为 PDF 打印阶段显式注入中文字体，避免 Linux 服务器缺少系统字体导致乱码

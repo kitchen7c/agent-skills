@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = REPO_ROOT / "assets" / "market_snapshot.template.json"
 PLACEHOLDER_HOSTS = {
@@ -247,6 +246,21 @@ def command_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_agent_browser_draft(args: argparse.Namespace) -> int:
+    from scripts.agent_browser_snapshot_builder import build_live_snapshot
+
+    payload = build_live_snapshot(
+        trade_date=args.trade_date,
+        as_of_utc=args.as_of_utc,
+        tv_session=args.tv_session,
+        bc_session=args.bc_session,
+        timeout_ms=args.timeout_ms,
+    )
+    write_json(Path(args.output), payload)
+    print(f"已写入 agent-browser snapshot 草稿: {args.output}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Brent 72H Research public-data helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -263,6 +277,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="treat placeholder source_url values as errors",
     )
     validate_parser.set_defaults(func=command_validate)
+
+    draft_parser = subparsers.add_parser(
+        "agent-browser-draft",
+        help="build snapshot draft from TradingView and Barchart via agent-browser",
+    )
+    draft_parser.add_argument("--trade-date", required=True)
+    draft_parser.add_argument("--as-of-utc", required=True)
+    draft_parser.add_argument("--tv-session", default="brent-tv-draft")
+    draft_parser.add_argument("--bc-session", default="brent-bc-draft")
+    draft_parser.add_argument("--timeout-ms", type=int, default=8000)
+    draft_parser.add_argument("--output", required=True)
+    draft_parser.set_defaults(func=command_agent_browser_draft)
     return parser
 
 

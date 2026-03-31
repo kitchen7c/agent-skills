@@ -4,6 +4,8 @@ import requests
 import json
 import base64
 import mimetypes
+import html
+import re
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 import fitz  # PyMuPDF，用于读取PDF内容
@@ -125,11 +127,11 @@ def build_embedded_font_css(font_sources):
     font_faces.append(
         "\n".join(
             [
-                "html, body, button, input, textarea, select, table, div, span, p, li, td, th {",
-                f"    font-family: {FALLBACK_FONT_STACK};",
+                "*, *::before, *::after {",
+                f"    font-family: {FALLBACK_FONT_STACK} !important;",
                 "}",
-                "strong, b, h1, h2, h3, h4, h5, h6 {",
-                f"    font-family: {FALLBACK_FONT_STACK};",
+                "html, body {",
+                f"    font-family: {FALLBACK_FONT_STACK} !important;",
                 "}",
             ]
         )
@@ -138,12 +140,255 @@ def build_embedded_font_css(font_sources):
     return "\n\n".join(font_faces)
 
 
+def validate_embedded_font(page):
+    """确认打印页面中的中文文本实际可使用嵌入字体。"""
+    return page.evaluate(
+        """
+        () => {
+            const probeText = "中文沥青价格测试";
+            const families = Array.from(document.querySelectorAll('body, body *'))
+                .slice(0, 20)
+                .map((el) => window.getComputedStyle(el).fontFamily);
+
+            const fontCheck = document.fonts
+                ? document.fonts.check('16px "Noto Sans SC Embedded"', probeText)
+                : false;
+
+            return {
+                fontCheck,
+                families,
+                bodyFontFamily: window.getComputedStyle(document.body).fontFamily,
+            };
+        }
+        """
+    )
+
+
 def inject_pdf_font_styles(html_content, font_css):
     """把 PDF 打印用的字体样式注入到 HTML 中。"""
     style_tag = f'\n<style id="pdf-font-fallbacks">\n{font_css}\n</style>\n'
     if "</head>" in html_content:
         return html_content.replace("</head>", f"{style_tag}</head>", 1)
     return f"{style_tag}{html_content}"
+
+
+def extract_json_payload(response_text):
+    """从模型输出中提取 JSON 对象。"""
+    cleaned = response_text.strip()
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("模型输出中未找到有效 JSON 对象")
+    return json.loads(cleaned[start : end + 1])
+
+
+def _format_inline_text(text):
+    escaped = html.escape(text or "")
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+
+
+def _render_paragraphs(paragraphs):
+    if not paragraphs:
+        return "<p>暂无数据。</p>"
+    return "".join(f"<p>{_format_inline_text(paragraph)}</p>" for paragraph in paragraphs)
+
+
+def _render_price_strip_items(items):
+    blocks = []
+    for item in items[:5]:
+        blocks.append(
+            "\n".join(
+                [
+                    '<div class="price-item">',
+                    f'    <div class="item-label">{html.escape(item.get("label", "-"))}</div>',
+                    f'    <div class="item-val">{html.escape(str(item.get("value", "-")))}</div>',
+                    f'    <div class="item-status">{html.escape(item.get("status", "-"))}</div>',
+                    "</div>",
+                ]
+            )
+        )
+    return "\n".join(blocks)
+
+
+def _render_news_cards(items):
+    accent_class = {
+        "red": "card-red",
+        "orange": "card-orange",
+        "blue": "card-blue",
+    }
+    blocks = []
+    for idx, item in enumerate(items[:3]):
+        blocks.append(
+            "\n".join(
+                [
+                    f'<div class="news-card {accent_class.get(item.get("accent"), ["card-red", "card-orange", "card-blue"][idx])}">',
+                    f'    <div class="card-tag">{html.escape(item.get("tag", "动态"))}</div>',
+                    f'    <div class="card-title">{html.escape(item.get("title", "-"))}</div>',
+                    f'    <div class="card-desc">{_format_inline_text(item.get("desc", "-"))}</div>',
+                    "</div>",
+                ]
+            )
+        )
+    return "\n".join(blocks)
+
+
+def _render_chart_bars(chart_items):
+    values = [float(item.get(key, 0) or 0) for item in chart_items[:3] for key in ("previous", "current")]
+    max_value = max(values) if values else 1
+
+    blocks = []
+    for item in chart_items[:3]:
+        previous = float(item.get("previous", 0) or 0)
+        current = float(item.get("current", 0) or 0)
+        previous_height = max(12, round(previous / max_value * 120)) if max_value else 12
+        current_height = max(12, round(current / max_value * 120)) if max_value else 12
+        blocks.append(
+            "\n".join(
+                [
+                    '<div class="bar-group">',
+                    f'    <div class="bar bar-bg-grey" style="height: {previous_height}px;">',
+                    f'        <div class="bar-val val-grey">{html.escape(str(item.get("previous", "-")))}</div>',
+                    "    </div>",
+                    f'    <div class="bar bar-bg-red" style="height: {current_height}px;">',
+                    f'        <div class="bar-val val-red">{html.escape(str(item.get("current", "-")))}</div>',
+                    "    </div>",
+                    "</div>",
+                ]
+            )
+        )
+    return "\n".join(blocks)
+
+
+def _render_x_labels(chart_items):
+    return "\n".join(
+        f"<div>{html.escape(item.get('label', '-'))}</div>" for item in chart_items[:3]
+    )
+
+
+def _render_aw_items(items):
+    blocks = []
+    for item in items[:3]:
+        blocks.append(
+            "\n".join(
+                [
+                    '<div class="aw-item">',
+                    f'    <div class="aw-item-title">{html.escape(item.get("title", "-"))}</div>',
+                    f'    <div class="aw-item-desc">{_format_inline_text(item.get("desc", "-"))}</div>',
+                    "</div>",
+                ]
+            )
+        )
+    return "\n".join(blocks)
+
+
+def _render_forecasts(items):
+    blocks = []
+    for item in items[:3]:
+        blocks.append(
+            "\n".join(
+                [
+                    "<div>",
+                    f'    <div class="fc-col-title">{html.escape(item.get("title", "-"))}</div>',
+                    f'    <div class="fc-price">{html.escape(item.get("price_range", "-"))}</div>',
+                    f'    <div class="fc-desc"><span class="fc-tag-green">支撑:</span> {_format_inline_text(item.get("support", "-"))}</div>',
+                    f'    <div class="fc-desc"><span class="fc-tag-red">阻力:</span> {_format_inline_text(item.get("resistance", "-"))}</div>',
+                    "</div>",
+                ]
+            )
+        )
+    return "\n".join(blocks)
+
+
+def render_report_template(template_html, report_data):
+    """使用固定模板渲染报告，避免模型输出任意 HTML/CSS。"""
+    chart = report_data.get("chart", {})
+    tokens = {
+        "{{REPORT_DATE}}": html.escape(report_data.get("report_date", "")),
+        "{{CONTRACT}}": html.escape(report_data.get("contract", "")),
+        "{{MAIN_PRICE}}": html.escape(str(report_data.get("main_price", ""))),
+        "{{MAIN_PRICE_STATUS}}": html.escape(report_data.get("main_price_status", "")),
+        "{{PRICE_STRIP_ITEMS}}": _render_price_strip_items(report_data.get("price_strip", [])),
+        "{{MARKET_SUMMARY_HTML}}": _render_paragraphs(report_data.get("market_summary", [])),
+        "{{TRADE_DYNAMICS_HTML}}": _render_paragraphs(report_data.get("trade_dynamics", [])),
+        "{{NEWS_CARDS}}": _render_news_cards(report_data.get("news", [])),
+        "{{CHART_PREVIOUS_DATE}}": html.escape(chart.get("previous_date", "")),
+        "{{CHART_CURRENT_DATE}}": html.escape(chart.get("current_date", "")),
+        "{{CHART_BARS}}": _render_chart_bars(chart.get("items", [])),
+        "{{CHART_X_LABELS}}": _render_x_labels(chart.get("items", [])),
+        "{{ADVICE_ITEMS}}": _render_aw_items(report_data.get("advice", [])),
+        "{{WARNING_ITEMS}}": _render_aw_items(report_data.get("warnings", [])),
+        "{{FORECAST_COLUMNS}}": _render_forecasts(report_data.get("forecasts", [])),
+        "{{FOOTER_DATE}}": html.escape(report_data.get("footer_date", "")),
+    }
+
+    rendered = template_html
+    for token, value in tokens.items():
+        rendered = rendered.replace(token, value)
+    return rendered
+
+
+def normalize_report_data(report_data, today_date, prices=None):
+    """补齐模板渲染所需字段，避免模型漏字段时直接渲染失败。"""
+    price_strip = report_data.get("price_strip", [])[:5]
+    while len(price_strip) < 5:
+        price_strip.append({"label": "-", "value": "-", "status": "-"})
+
+    if prices:
+        price_map = {
+            "华东": prices.get("huadong"),
+            "华南": prices.get("huanan"),
+        }
+        for item in price_strip:
+            market = price_map.get(item.get("label"))
+            if market:
+                item["value"] = market.get("price", item.get("value", "-"))
+                item["status"] = market.get("change", item.get("status", "-"))
+
+    chart = report_data.get("chart", {})
+    chart_items = chart.get("items", [])[:3]
+    while len(chart_items) < 3:
+        chart_items.append({"label": "-", "previous": 0, "current": 0})
+
+    def ensure_items(items, count):
+        normalized = list(items[:count])
+        while len(normalized) < count:
+            normalized.append({"title": "-", "desc": "-"})
+        return normalized
+
+    forecasts = list(report_data.get("forecasts", [])[:3])
+    while len(forecasts) < 3:
+        forecasts.append(
+            {"title": "-", "price_range": "-", "support": "-", "resistance": "-"}
+        )
+
+    return {
+        "report_date": report_data.get("report_date", today_date),
+        "contract": report_data.get("contract", "上海主力合约 (BU主力)"),
+        "main_price": report_data.get("main_price", "-"),
+        "main_price_status": report_data.get("main_price_status", ""),
+        "price_strip": price_strip,
+        "market_summary": report_data.get("market_summary", []),
+        "trade_dynamics": report_data.get("trade_dynamics", []),
+        "news": report_data.get("news", [])[:3],
+        "chart": {
+            "previous_date": chart.get("previous_date", ""),
+            "current_date": chart.get("current_date", today_date),
+            "items": chart_items,
+        },
+        "advice": ensure_items(report_data.get("advice", []), 3),
+        "warnings": ensure_items(report_data.get("warnings", []), 3),
+        "forecasts": forecasts,
+        "footer_date": report_data.get("footer_date", today_date.replace("年", "-").replace("月", "-").replace("日", "")),
+    }
 
 
 def send_pdf_to_dingtalk(file_path, target_user_id="42706"):
@@ -327,7 +572,7 @@ class ArgusDownloader:
             print(f"读取HTML模板失败: {e}")
             return
 
-        print("3. 正在调用大模型生成中文版 HTML (这可能需要几十秒)...")
+        print("3. 正在调用大模型提取结构化中文内容 (这可能需要几十秒)...")
         # 此处配置 OpenAI 兼容的地址和 Key，请替换为您实际使用的配置
         # 也可以通过环境变量读取: os.environ.get("OPENAI_API_KEY")
         api_key = os.environ.get(
@@ -356,26 +601,67 @@ class ArgusDownloader:
                 hn = prices["huanan"]
                 price_info = f"\n【今日隆众沥青市场价格参考】\n- 华东地区: 价格 {hd['price']}, 较前日变动 {hd['change']}\n- 华南地区: 价格 {hn['price']}, 较前日变动 {hn['change']}\n"
 
-            # 【重要】为了防止被公司网关/WAF拦截(403 Forbidden)，我们将HTML模板进行 Base64 编码后再发送给大模型
-            b64_template = base64.b64encode(html_template.encode("utf-8")).decode(
-                "utf-8"
-            )
-
             prompt = f"""
-你是一个专业的沥青行业分析师和前端开发工程师。
-我将提供一份【最新的英文沥青日报PDF文本内容】和一份【经过Base64编码的中文HTML模板】。
-请提取PDF中的核心数据和信息（如报告日期、各地区FOB和现货价格、市场综述、交易动态、新闻、预测等），将其准确翻译为中文，并严格按照HTML模板的结构和样式，生成一份全新的中文网页版日报。
+你是一个专业的沥青行业分析师。
+我将提供一份【最新的英文沥青日报PDF文本内容】。请你提取核心数据，并输出一份严格符合指定 schema 的 JSON。
 
 注意：
-1. 提供的【HTML模板】是经过 Base64 编码的。你需要先在内部解码它，了解其结构和样式。
-2. 确保新生成的HTML在结构、CSS样式、色彩和排版上与原模板完全一致。
-3. 数据和文本必须严谨准确，基于英文原文进行翻译和总结。重点结论内容请加粗（<strong>）突出显示。
-4. 将报告日期改成：{today_date}。
-5. 【重要要求】：在报告的合适位置（在各国价格数据部分）新增并展示以下【今日隆众沥青市场价格参考】，请确保样式与模板整体风格协调统一：{price_info}
-6. 【重要】你的输出必须是直接可用的、未经Base64编码的标准明文 HTML 代码。不要包含任何markdown代码块标记（如 ```html ），也不要输出任何额外的解释说明文字。
+1. 只输出 JSON 对象，不要输出 markdown 代码块，不要输出任何解释。
+2. 所有字段都必须返回；若原文没有明确信息，请填 "-" 或空数组。
+3. `market_summary`、`trade_dynamics` 为字符串数组，每项是一段中文。
+4. `news` 固定返回 3 条；`accent` 只能是 `red`、`orange`、`blue`。
+5. `advice`、`warnings` 固定返回 3 条，每条包含 `title` 和 `desc`。
+6. `forecasts` 固定返回 3 条，每条包含 `title`、`price_range`、`support`、`resistance`。
+7. `chart.items` 固定返回 3 条，分别对应新加坡、韩国、伊朗；数值字段返回数字。
+8. 报告日期使用 `{today_date}`。
+9. 今日隆众沥青市场价格参考如下，请合并到 `price_strip` 中的“华东”“华南”项：{price_info}
 
-【经过Base64编码的HTML模板】：
-{b64_template}
+JSON schema:
+{{
+  "report_date": "{today_date}",
+  "contract": "上海主力合约 (BU主力)",
+  "main_price": "-",
+  "main_price_status": "-",
+  "price_strip": [
+    {{"label": "FOB 新加坡 (ABX 1)", "value": "-", "status": "-"}},
+    {{"label": "FOB 韩国 (ABX 2)", "value": "-", "status": "-"}},
+    {{"label": "FOB 伊朗 (散装)", "value": "-", "status": "-"}},
+    {{"label": "华东", "value": "-", "status": "-"}},
+    {{"label": "华南", "value": "-", "status": "-"}}
+  ],
+  "market_summary": ["-"],
+  "trade_dynamics": ["-"],
+  "news": [
+    {{"tag": "-", "title": "-", "desc": "-", "accent": "red"}},
+    {{"tag": "-", "title": "-", "desc": "-", "accent": "orange"}},
+    {{"tag": "-", "title": "-", "desc": "-", "accent": "blue"}}
+  ],
+  "chart": {{
+    "previous_date": "-",
+    "current_date": "{today_date}",
+    "items": [
+      {{"label": "新加坡 ABX 1", "previous": 0, "current": 0}},
+      {{"label": "韩国离岸价", "previous": 0, "current": 0}},
+      {{"label": "伊朗散装价", "previous": 0, "current": 0}}
+    ]
+  }},
+  "advice": [
+    {{"title": "-", "desc": "-"}},
+    {{"title": "-", "desc": "-"}},
+    {{"title": "-", "desc": "-"}}
+  ],
+  "warnings": [
+    {{"title": "-", "desc": "-"}},
+    {{"title": "-", "desc": "-"}},
+    {{"title": "-", "desc": "-"}}
+  ],
+  "forecasts": [
+    {{"title": "新加坡 (ABX 1)", "price_range": "-", "support": "-", "resistance": "-"}},
+    {{"title": "韩国离岸 (ABX 2)", "price_range": "-", "support": "-", "resistance": "-"}},
+    {{"title": "伊朗离岸 (FOB)", "price_range": "-", "support": "-", "resistance": "-"}}
+  ],
+  "footer_date": "{today_date}"
+}}
 
 【最新英文PDF文本】：
 {pdf_text}
@@ -386,15 +672,11 @@ class ArgusDownloader:
                 temperature=0.2,
             )
 
-            new_html_content = response.choices[0].message.content.strip()
-
-            # 清理大模型可能输出的 markdown 标记
-            if new_html_content.startswith("```html"):
-                new_html_content = new_html_content[7:]
-            if new_html_content.startswith("```"):
-                new_html_content = new_html_content[3:]
-            if new_html_content.endswith("```"):
-                new_html_content = new_html_content[:-3]
+            report_payload = extract_json_payload(
+                response.choices[0].message.content.strip()
+            )
+            report_payload = normalize_report_data(report_payload, today_date, prices)
+            new_html_content = render_report_template(html_template, report_payload)
 
             # 为 PDF 打印阶段显式注入中文字体，避免 Linux 服务器缺少系统字体导致乱码
             embedded_fonts = resolve_chinese_font_paths()
@@ -434,6 +716,16 @@ class ArgusDownloader:
             temp_page.wait_for_function(
                 "() => document.fonts && document.fonts.status === 'loaded'"
             )
+
+            font_validation = validate_embedded_font(temp_page)
+            print(
+                "-> PDF 字体验证:",
+                json.dumps(font_validation, ensure_ascii=False),
+            )
+            if embedded_fonts and not font_validation.get("fontCheck"):
+                raise RuntimeError(
+                    "嵌入中文字体未在打印页面生效，已中止 PDF 生成以避免输出乱码文件"
+                )
 
             # 导出为 PDF (A4纸尺寸，包含背景色)
             temp_page.pdf(path=str(new_pdf_path), format="A4", print_background=True)

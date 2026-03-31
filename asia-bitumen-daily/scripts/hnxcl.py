@@ -35,6 +35,13 @@ FALLBACK_FONT_STACK = (
 )
 
 
+def get_required_env(name):
+    value = os.environ.get(name)
+    if value:
+        return value
+    raise RuntimeError(f"缺少必需环境变量: {name}")
+
+
 def ensure_output_dir(output_dir):
     """规范化并确保输出目录存在。"""
     if not output_dir:
@@ -436,8 +443,8 @@ def normalize_report_data(report_data, today_date, prices=None):
 
 def send_pdf_to_dingtalk(file_path, target_user_id="42706"):
     """将文件推送到指定的钉钉用户"""
-    client_id = "dingbjo5gjxnh0a3y4ti"
-    client_secret = "fKG-5M86zrJ7Wu23eZlaJ4Ki1TBHBRiLuBTOegZC9gQ60EVDkbnna6_KHwy1Uy6V"
+    client_id = get_required_env("DINGTALK_APP_KEY")
+    client_secret = get_required_env("DINGTALK_APP_SECRET")
 
     try:
         print(f"开始推送文件到钉钉，目标用户: {target_user_id}...")
@@ -546,17 +553,20 @@ class ArgusDownloader:
 
     def login(self):
         """执行登录操作"""
+        argus_email = get_required_env("ARGUS_EMAIL")
+        argus_password = get_required_env("ARGUS_PASSWORD")
+
         print("正在访问网站...")
         self.page.goto("https://direct.argusmedia.com/")
 
         # 1. 登录流程 - 输入邮箱
         self.page.wait_for_selector('input[type="email"]')
-        self.page.fill('input[type="email"]', "wangjiali001@sdic.com.cn")
+        self.page.fill('input[type="email"]', argus_email)
         self.page.get_by_role("button", name="Next").click()
 
         # 2. 登录流程 - 输入密码
         self.page.wait_for_selector('input[type="password"]')
-        self.page.fill('input[type="password"]', "1985Py--")
+        self.page.fill('input[type="password"]', argus_password)
         self.page.get_by_role("button", name="Sign in").click()
 
         print("登录成功，正在跳转页面...")
@@ -636,17 +646,9 @@ class ArgusDownloader:
             return
 
         print("3. 正在调用大模型提取结构化中文内容 (这可能需要几十秒)...")
-        # 此处配置 OpenAI 兼容的地址和 Key，请替换为您实际使用的配置
-        # 也可以通过环境变量读取: os.environ.get("OPENAI_API_KEY")
-        api_key = os.environ.get(
-            "OPENAI_API_KEY", "sk-1yagyFC2iWQD06Y00Bfnx6VjLpLROnEbmai69JpZOa3AWYVs"
-        )
-        base_url = os.environ.get(
-            "OPENAI_BASE_URL", "https://agi-prod.chambroad.com/v1"
-        )  # 请修改为您的gemini兼容代理地址
-        model_name = os.environ.get(
-            "MODEL_NAME", "gemini-3.1-flash-lite-preview"
-        )  # 模型名称
+        api_key = get_required_env("OPENAI_API_KEY")
+        base_url = get_required_env("OPENAI_BASE_URL")
+        model_name = os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite-preview")
 
         try:
             client = OpenAI(api_key=api_key, base_url=base_url)

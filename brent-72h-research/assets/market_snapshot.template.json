@@ -1,0 +1,182 @@
+{
+  "trade_date": "2026-03-31",
+  "as_of_utc": "2026-03-31T08:00:00Z",
+  "report_horizon_hours": 72,
+  "market": {
+    "risk_free_rate": 0.043,
+    "contract_multiplier": 1000,
+    "contracts": {
+      "m2": {
+        "label": "Brent M+2",
+        "symbol": "BRN_M2_PROXY",
+        "used_price": 73.4,
+        "used_source_name": "Source A",
+        "used_source_url": "https://example.com/brent-m2-a",
+        "used_timestamp_utc": "2026-03-31T07:30:00Z",
+        "used_reference_type": "last_close",
+        "selection_reason": "两路公开源差异在阈值内，采用成交更接近结算逻辑的一路。",
+        "cross_checks": [
+          {
+            "source_name": "Source A",
+            "source_url": "https://example.com/brent-m2-a",
+            "timestamp_utc": "2026-03-31T07:30:00Z",
+            "price": 73.4,
+            "reference_type": "last_close"
+          },
+          {
+            "source_name": "Source B",
+            "source_url": "https://example.com/brent-m2-b",
+            "timestamp_utc": "2026-03-31T07:31:00Z",
+            "price": 73.46,
+            "reference_type": "last_close"
+          }
+        ]
+      },
+      "m3": {
+        "label": "Brent M+3",
+        "symbol": "BRN_M3_PROXY",
+        "used_price": 73.02,
+        "used_source_name": "Source A",
+        "used_source_url": "https://example.com/brent-m3-a",
+        "used_timestamp_utc": "2026-03-31T07:30:00Z",
+        "used_reference_type": "last_close",
+        "selection_reason": "采用交叉验证后一致性更高的数值。",
+        "cross_checks": [
+          {
+            "source_name": "Source A",
+            "source_url": "https://example.com/brent-m3-a",
+            "timestamp_utc": "2026-03-31T07:30:00Z",
+            "price": 73.02,
+            "reference_type": "last_close"
+          },
+          {
+            "source_name": "Source B",
+            "source_url": "https://example.com/brent-m3-b",
+            "timestamp_utc": "2026-03-31T07:31:00Z",
+            "price": 73.07,
+            "reference_type": "last_close"
+          }
+        ]
+      },
+      "m4": {
+        "label": "Brent M+4",
+        "symbol": "BRN_M4_PROXY",
+        "used_price": 72.71,
+        "used_source_name": "Source A",
+        "used_source_url": "https://example.com/brent-m4-a",
+        "used_timestamp_utc": "2026-03-31T07:30:00Z",
+        "used_reference_type": "last_close",
+        "selection_reason": "采用更接近结算时点的来源。",
+        "cross_checks": [
+          {
+            "source_name": "Source A",
+            "source_url": "https://example.com/brent-m4-a",
+            "timestamp_utc": "2026-03-31T07:30:00Z",
+            "price": 72.71,
+            "reference_type": "last_close"
+          },
+          {
+            "source_name": "Source B",
+            "source_url": "https://example.com/brent-m4-b",
+            "timestamp_utc": "2026-03-31T07:31:00Z",
+            "price": 72.78,
+            "reference_type": "last_close"
+          }
+        ]
+      }
+    },
+    "ovx": {
+      "label": "OVX（WTI-linked，代理指标）",
+      "level": 31.2,
+      "timestamp_utc": "2026-03-31T07:30:00Z",
+      "source_name": "Public OVX Source",
+      "source_url": "https://example.com/ovx",
+      "proxy": true
+    },
+    "positioning": {
+      "label": "公开定位代理",
+      "value_text": "WTI managed money 净多头回升，代理指标",
+      "timestamp_utc": "2026-03-28T00:00:00Z",
+      "source_name": "Public Positioning Source",
+      "source_url": "https://example.com/positioning",
+      "proxy": true
+    },
+    "jump_catalysts": [
+      {
+        "date_utc": "2026-04-01T14:30:00Z",
+        "label": "EIA 库存数据",
+        "why_it_matters": "库存意外会放大近端 Brent 波动。",
+        "source_name": "EIA Calendar",
+        "source_url": "https://example.com/eia"
+      },
+      {
+        "date_utc": "2026-04-02T08:00:00Z",
+        "label": "OPEC+ 相关公开表态窗口",
+        "why_it_matters": "供给预期变化可能推高上行跳跃风险。",
+        "source_name": "Public News Source",
+        "source_url": "https://example.com/opec"
+      }
+    ]
+  },
+  "history": {
+    "m2_daily_closes": [
+      {"date": "2026-03-02", "close": 70.12},
+      {"date": "2026-03-03", "close": 69.88},
+      {"date": "2026-03-04", "close": 70.41},
+      {"date": "2026-03-05", "close": 70.95},
+      {"date": "2026-03-06", "close": 71.22},
+      {"date": "2026-03-09", "close": 70.84},
+      {"date": "2026-03-10", "close": 71.31},
+      {"date": "2026-03-11", "close": 71.76},
+      {"date": "2026-03-12", "close": 71.58},
+      {"date": "2026-03-13", "close": 71.94},
+      {"date": "2026-03-16", "close": 72.21},
+      {"date": "2026-03-17", "close": 72.46},
+      {"date": "2026-03-18", "close": 72.11},
+      {"date": "2026-03-19", "close": 72.78},
+      {"date": "2026-03-20", "close": 72.64},
+      {"date": "2026-03-23", "close": 72.93},
+      {"date": "2026-03-24", "close": 73.16},
+      {"date": "2026-03-25", "close": 73.02},
+      {"date": "2026-03-26", "close": 73.48},
+      {"date": "2026-03-27", "close": 73.24},
+      {"date": "2026-03-30", "close": 73.4}
+    ]
+  },
+  "forecast": {
+    "direction": "偏多",
+    "median_72h_target": 74.6,
+    "event_risk_regime": "elevated",
+    "thesis": "近端供给扰动与曲线维持 backwardation，对 72 小时方向形成上偏支撑。"
+  },
+  "strategies": {
+    "futures": {
+      "name": "Brent M+2 单边多头",
+      "type": "outright",
+      "contract_key": "m2",
+      "side": "long",
+      "entry_zone": [72.9, 73.5],
+      "invalidation": 72.1,
+      "targets": [74.8, 75.9],
+      "pnl_ladder_levels": [72.1, 74.8, 75.9]
+    },
+    "options": {
+      "name": "72H 看涨价差",
+      "expiry": "2026-05-29",
+      "structure_type": "vertical_call_spread",
+      "legs": [
+        {"label": "买入 73C", "side": "long", "option_type": "call", "strike": 73.0},
+        {"label": "卖出 76C", "side": "short", "option_type": "call", "strike": 76.0}
+      ]
+    }
+  },
+  "proxy_option_surface": {
+    "expiry": "2026-05-29",
+    "atm_iv": 0.29,
+    "skew_proxy": {
+      "call25_iv": 0.27,
+      "put25_iv": 0.33
+    },
+    "notes": "Brent 实时完整公开期权链不可得，使用代理波动率假设。"
+  }
+}

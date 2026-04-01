@@ -149,9 +149,25 @@
             font-size: 13px;
         }
 
+        .price-main span.status-up,
+        .item-status.status-up,
         .status-up {
             color: #e3000f;
             font-weight: bold;
+        }
+
+        .price-main span.status-down,
+        .item-status.status-down,
+        .status-down {
+            color: #1a8f4b;
+            font-weight: bold;
+        }
+
+        .price-main span.status-flat,
+        .item-status.status-flat,
+        .status-flat {
+            color: #888;
+            font-weight: normal;
         }
 
         /* Text Sections */
@@ -552,7 +568,7 @@
             </div>
             <div class="header-right">
                 <div class="contract">{{CONTRACT}}</div>
-                <div class="price-main">{{MAIN_PRICE}}<span>{{MAIN_PRICE_STATUS}}</span></div>
+                <div class="price-main">{{MAIN_PRICE}}{{MAIN_PRICE_STATUS_HTML}}</div>
             </div>
         </div>
 
@@ -616,9 +632,9 @@
 
         <!-- Footer -->
         <div class="footer">
-            <div>ARGUS MEDIA INTELLIGENCE - ASIA BITUMEN SECTOR</div>
+            <div></div>
             <div class="footer-right">
-                数据来源: {{ARGUS_SOURCE_FILE}} · {{ARGUS_SOURCE_DATE_NOTE}} <div class="footer-square"></div>
+                数据来源: {{ARGUS_SOURCE_FILE}} <div class="footer-square"></div>
             </div>
         </div>
         

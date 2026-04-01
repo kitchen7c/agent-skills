@@ -8,7 +8,7 @@ import mimetypes
 import html
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from playwright.sync_api import sync_playwright
@@ -104,6 +104,19 @@ def filename_matches_target_date(filename, target_yyyymmdd):
         or dashed in stem
         or month_abbr.lower() in lowered
     )
+
+
+def argus_expected_report_date(reference_dt=None):
+    """Argus 日报日期规则：
+    - 周一下载对应上周五
+    - 周二到周五下载对应前一天
+    """
+    dt = reference_dt or datetime.now()
+    if dt.weekday() == 0:
+        delta_days = 3
+    else:
+        delta_days = 1
+    return (dt - timedelta(days=delta_days)).strftime("%Y%m%d")
 
 
 def extract_report_date_from_filename(filename):
@@ -220,6 +233,103 @@ def normalize_status_display(status):
     return raw
 
 
+def normalize_price_display(value):
+    raw = str(value).strip() if value is not None else "-"
+    if not raw or raw == "-":
+        return "-"
+
+    raw = (
+        raw.replace("美元/吨", "")
+        .replace("元/吨", "")
+        .replace("美元", "")
+        .replace("元", "")
+        .strip()
+    )
+    compact = raw.replace(",", "").replace(" ", "")
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", compact):
+        numeric = f"{float(compact):f}"
+        return numeric.rstrip("0").rstrip(".")
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?-[-+]?\d+(?:\.\d+)?", compact):
+        return raw
+    return raw
+
+
+def has_meaningful_value(value):
+    text = str(value or "").strip()
+    return text not in {"", "-", "未知", "None", "null"}
+
+
+def extract_market_price_snapshot(card_text, region_label):
+    lines = [
+        line.strip()
+        for line in str(card_text or "").splitlines()
+        if line.strip()
+    ]
+    lines = [line for line in lines if line != region_label]
+
+    price = "未知"
+    change = "未知"
+
+    for idx, line in enumerate(lines):
+        compact = line.replace(",", "").replace(" ", "")
+        if price == "未知" and re.fullmatch(r"\d+(?:\.\d+)?", compact):
+            price = line.strip()
+            for next_line in lines[idx + 1 :]:
+                next_compact = next_line.replace(" ", "")
+                if (
+                    "%" in next_compact
+                    or "|" in next_compact
+                    or "上涨" in next_compact
+                    or "下跌" in next_compact
+                    or next_compact.startswith(("+", "-"))
+                ):
+                    change = next_line.strip()
+                    break
+            continue
+
+        if change == "未知":
+            if (
+                "%" in compact
+                or "|" in compact
+                or "上涨" in compact
+                or "下跌" in compact
+                or compact.startswith(("+", "-"))
+            ):
+                change = line.strip()
+
+    return price, change
+
+
+def extract_market_price_from_section(section_text, region_label):
+    lines = [
+        line.strip()
+        for line in str(section_text or "").splitlines()
+        if line.strip()
+    ]
+
+    for idx, line in enumerate(lines):
+        if line != region_label:
+            continue
+
+        remaining = lines[idx + 1 : idx + 4]
+        price, change = extract_market_price_snapshot(
+            "\n".join([region_label] + remaining), region_label
+        )
+        if has_meaningful_value(price):
+            return price, change
+
+    return "未知", "未知"
+
+
+def status_css_class(status_text):
+    text = str(status_text or "").strip()
+    if text.startswith("▲"):
+        return "status-up"
+    if text.startswith("▼"):
+        return "status-down"
+    return "status-flat"
+
+
 def normalize_forecast_reason(text, title, kind):
     raw = str(text or "").strip()
     if not raw or raw == "-":
@@ -334,7 +444,7 @@ def build_source_metadata(
 
     return {
         "argus_source_date_note": " | ".join(note_parts),
-        "argus_source_file": source_name or source_label or "-",
+        "argus_source_file": f"{source_name or source_label or '-'}、隆众资讯",
     }
 
 
@@ -467,7 +577,23 @@ def extract_json_payload(response_text):
     end = cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
         raise ValueError("模型输出中未找到有效 JSON 对象")
-    return json.loads(cleaned[start : end + 1])
+    candidate = cleaned[start : end + 1]
+
+    replacements = {
+        "“": '"',
+        "”": '"',
+        "‘": '"',
+        "’": '"',
+        "：": ":",
+        "，": ",",
+    }
+    for source, target in replacements.items():
+        candidate = candidate.replace(source, target)
+
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    candidate = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", candidate)
+
+    return json.loads(candidate)
 
 
 def _format_inline_text(text):
@@ -485,13 +611,15 @@ def _render_price_strip_items(items):
     blocks = []
     for item in items[:5]:
         status_text = normalize_status_display(item.get("status", "-"))
+        status_class = status_css_class(status_text)
+        value_text = normalize_price_display(item.get("value", "-"))
         blocks.append(
             "\n".join(
                 [
                     '<div class="price-item">',
                     f'    <div class="item-label">{html.escape(item.get("label", "-"))}</div>',
-                    f'    <div class="item-val">{html.escape(str(item.get("value", "-")))}</div>',
-                    f'    <div class="item-status">{html.escape(status_text)}</div>',
+                    f'    <div class="item-val">{html.escape(value_text)}</div>',
+                    f'    <div class="item-status {status_class}">{html.escape(status_text)}</div>',
                     "</div>",
                 ]
             )
@@ -597,11 +725,13 @@ def _render_forecasts(items):
 def render_report_template(template_html, report_data):
     """使用固定模板渲染报告，避免模型输出任意 HTML/CSS。"""
     chart = report_data.get("chart", {})
+    main_price_status = report_data.get("main_price_status", "")
+    main_price_status_class = status_css_class(main_price_status)
     tokens = {
         "{{REPORT_DATE}}": html.escape(report_data.get("report_date", "")),
         "{{CONTRACT}}": html.escape(report_data.get("contract", "")),
-        "{{MAIN_PRICE}}": html.escape(str(report_data.get("main_price", ""))),
-        "{{MAIN_PRICE_STATUS}}": html.escape(report_data.get("main_price_status", "")),
+        "{{MAIN_PRICE}}": html.escape(normalize_price_display(report_data.get("main_price", ""))),
+        "{{MAIN_PRICE_STATUS_HTML}}": f'<span class="{main_price_status_class}">{html.escape(main_price_status)}</span>',
         "{{PRICE_STRIP_ITEMS}}": _render_price_strip_items(report_data.get("price_strip", [])),
         "{{MARKET_SUMMARY_HTML}}": _render_paragraphs(report_data.get("market_summary", [])),
         "{{TRADE_DYNAMICS_HTML}}": _render_paragraphs(report_data.get("trade_dynamics", [])),
@@ -630,16 +760,29 @@ def normalize_report_data(report_data, today_date, prices=None):
     while len(price_strip) < 5:
         price_strip.append({"label": "-", "value": "-", "status": "-"})
 
+    label_aliases = {
+        "华东": "华东地区批发",
+        "华南": "华南地区批发",
+    }
+    for item in price_strip:
+        item["label"] = label_aliases.get(item.get("label"), item.get("label"))
+
     if prices:
         price_map = {
             "华东": prices.get("huadong"),
             "华南": prices.get("huanan"),
+            "华东地区批发": prices.get("huadong"),
+            "华南地区批发": prices.get("huanan"),
         }
         for item in price_strip:
             market = price_map.get(item.get("label"))
             if market:
-                item["value"] = market.get("price", item.get("value", "-"))
-                item["status"] = market.get("change", item.get("status", "-"))
+                scraped_price = market.get("price", item.get("value", "-"))
+                scraped_change = market.get("change", item.get("status", "-"))
+                if has_meaningful_value(scraped_price):
+                    item["value"] = scraped_price
+                if has_meaningful_value(scraped_change):
+                    item["status"] = scraped_change
 
     chart = report_data.get("chart", {})
     chart_items = chart.get("items", [])[:3]
@@ -767,6 +910,10 @@ class ArgusDownloader:
     @staticmethod
     def current_report_date():
         return datetime.now().strftime("%Y%m%d")
+
+    @staticmethod
+    def expected_argus_report_date():
+        return argus_expected_report_date(datetime.now())
 
     def get_target_dir(self):
         return Path(self.output_dir or os.getcwd())
@@ -903,6 +1050,31 @@ class ArgusDownloader:
             candidates.append({"row": row, "text": text, "score": score})
         return candidates
 
+    def locate_publication_download_row(self):
+        return (
+            self.page.locator("div, li, tr")
+            .filter(has_text="Argus Asia Bitumen Daily")
+            .filter(has_text="PDF")
+            .last
+        )
+
+    def locate_article_link(self):
+        patterns = [
+            re.compile(r"Asia bitumen daily", re.I),
+            re.compile(r"Argus Asia Bitumen Daily", re.I),
+        ]
+        for pattern in patterns:
+            for locator in (
+                self.page.get_by_role("link", name=pattern),
+                self.page.get_by_text(pattern),
+            ):
+                try:
+                    locator.first.wait_for(state="visible", timeout=3000)
+                    return locator.first
+                except Exception:
+                    continue
+        return None
+
     def find_today_report_download(self, target_date):
         candidates = self.collect_publication_candidates()
         selected = select_publication_candidate(candidates, target_date)
@@ -915,23 +1087,13 @@ class ArgusDownloader:
     def download_publication_pdf(self, target_date):
         print("正在打开 Publications 菜单...")
         self.open_publications_menu()
-
-        candidates = self.collect_publication_candidates()
-        if not candidates:
-            raise ArgusStageError("publications_download", "未枚举到任何 Argus Asia Bitumen Daily 候选项")
-
-        print("已枚举到以下候选项:")
-        for candidate in candidates:
-            print(f"- {candidate['text']}")
-
-        selected = select_publication_candidate(candidates, target_date)
-        if not selected:
-            raise ArgusStageError("publications_download", "未找到可用的 Argus Asia Bitumen Daily 候选项")
-
-        print(f"准备下载候选项: {selected['text']}")
+        self.page.wait_for_selector("text=Argus Asia Bitumen Daily", timeout=10000)
+        row = self.locate_publication_download_row()
+        row.wait_for(state="visible", timeout=5000)
+        print(f"准备下载候选项: {row.inner_text(timeout=3000).strip()}")
         try:
             with self.page.expect_download(timeout=15000) as download_info:
-                self._click_candidate_for_pdf(selected)
+                row.get_by_text("PDF", exact=True).first.click(timeout=5000)
             download = download_info.value
         except Exception as exc:
             raise ArgusStageError("publications_download", f"点击 PDF 下载失败: {exc}") from exc
@@ -959,20 +1121,18 @@ class ArgusDownloader:
             self.open_publications_menu()
         except Exception:
             pass
-
-        candidates = self.collect_publication_candidates()
-        selected = select_publication_candidate(candidates, target_date)
-        if not selected:
-            raise ArgusStageError("article_fallback", "文章回退失败: 未找到 Argus Asia Bitumen Daily 候选项")
+        article_link = self.locate_article_link()
+        if article_link is None:
+            raise ArgusStageError("article_fallback", "文章回退失败: 未找到 Asia bitumen daily 文章链接")
 
         active_page = self.page
         try:
             with self.context.expect_page(timeout=5000) as new_page_info:
-                self._click_candidate_for_article(selected)
+                article_link.click(timeout=5000)
             active_page = new_page_info.value
             active_page.wait_for_load_state("load")
         except Exception:
-            self._click_candidate_for_article(selected)
+            article_link.click(timeout=5000)
             try:
                 self.page.wait_for_load_state("load")
             except Exception:
@@ -1005,7 +1165,7 @@ class ArgusDownloader:
         return FetchResult(
             source_type="argus_direct_article_fallback",
             source_name="Argus Direct Article",
-            source_report_date=extract_report_date_from_filename(selected["text"]),
+            source_report_date="-",
             artifact_path=artifact_path,
             text_content=article_text,
             fallback_reason=fallback_reason,
@@ -1062,7 +1222,7 @@ class ArgusDownloader:
     def get_asia_bitumen_daily(self):
         """获取亚洲沥青日报 (Argus Asia Bitumen Daily)"""
         print("准备下载: Argus Asia Bitumen Daily")
-        target_date = self.current_report_date()
+        target_date = self.expected_argus_report_date()
         fetch_result = None
         primary_error = None
         prices = None
@@ -1189,10 +1349,10 @@ class ArgusDownloader:
 5. `news` 只能围绕下方“候选行业动态原文”改写，不要引入原文中未出现的国家、公司、政策或事件。
 6. `advice`、`warnings` 固定返回 3 条，每条包含 `title` 和 `desc`。
 7. `forecasts` 固定返回 3 条，每条包含 `title`、`price_range`、`support`、`resistance`。
-8. `support`、`resistance` 必须是中文短句，解释支撑/阻力的依据与洞察，不要只填数字价位；如果需要提到价位，请把价位写在句子里。
+8. `support`、`resistance` 请写得专业、清晰、简洁，解释支撑/阻力的依据与洞察；不要只填数字价位，如果需要提到价位，请把价位写进说明里。
 9. `chart.items` 固定返回 3 条，分别对应新加坡、韩国、伊朗；数值字段返回数字。
 10. 报告日期使用 `{today_date}`。
-11. 今日隆众沥青市场价格参考如下，请合并到 `price_strip` 中的“华东”“华南”项：{price_info}
+11. 今日隆众沥青市场价格参考如下，请合并到 `price_strip` 中的“华东地区批发”“华南地区批发”项：{price_info}
 
 候选行业动态原文：
 {news_candidates_prompt}
@@ -1207,8 +1367,8 @@ JSON schema:
     {{"label": "FOB 新加坡 (ABX 1)", "value": "-", "status": "-"}},
     {{"label": "FOB 韩国 (ABX 2)", "value": "-", "status": "-"}},
     {{"label": "FOB 伊朗 (散装)", "value": "-", "status": "-"}},
-    {{"label": "华东", "value": "-", "status": "-"}},
-    {{"label": "华南", "value": "-", "status": "-"}}
+    {{"label": "华东地区批发", "value": "-", "status": "-"}},
+    {{"label": "华南地区批发", "value": "-", "status": "-"}}
   ],
   "market_summary": ["-"],
   "trade_dynamics": ["-"],
@@ -1252,10 +1412,13 @@ JSON schema:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-
-            report_payload = extract_json_payload(
-                response.choices[0].message.content.strip()
+            raw_model_output = response.choices[0].message.content.strip()
+            raw_output_path = prepare_output_path(
+                self.get_target_dir() / f"llm_raw_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             )
+            raw_output_path.write_text(raw_model_output, encoding="utf-8")
+
+            report_payload = extract_json_payload(raw_model_output)
             report_payload = normalize_report_data(report_payload, today_date, prices)
             report_payload["report_date"] = today_date
             report_payload["footer_date"] = today_date.replace("年", "-").replace("月", "-").replace("日", "")
@@ -1399,7 +1562,11 @@ JSON schema:
         """获取隆众沥青价格信息"""
         print("\n=== 开始获取隆众沥青价格 ===")
         print("1. 正在访问隆众能源网...")
-        self.page.goto("https://oil.oilchem.net/oil/asphalt.shtml")
+        self.page.goto(
+            "https://oil.oilchem.net/oil/asphalt.shtml",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
 
         print("2. 等待并点击顶部'能源'页签...")
         ny_link = self.page.locator("a", has_text="能源").filter(has_text="能源").first
@@ -1420,12 +1587,12 @@ JSON schema:
                 with self.context.expect_page(timeout=3000) as new_page_info:
                     target_link.click()
                 active_page = new_page_info.value
-                active_page.wait_for_load_state("load")
+                active_page.wait_for_load_state("load", timeout=60000)
                 print("-> 已打开新页面")
             except Exception:
                 # 没有触发新页面（例如 target 并非 _blank），则在当前页面继续
                 active_page = self.page
-                active_page.wait_for_load_state("load")
+                active_page.wait_for_load_state("load", timeout=60000)
                 print("-> 在当前页面加载完成")
 
             active_page.wait_for_timeout(2000)  # 等待 DOM 渲染
@@ -1433,20 +1600,24 @@ JSON schema:
             print("4. 正在提取华东和华南价格及其变动...")
             result = {}
             try:
+                market_price_section = (
+                    active_page.locator("div, section")
+                    .filter(has_text=re.compile(r"沥青市场价格|Market Price", re.I))
+                    .first
+                )
+                market_price_section.wait_for(state="visible", timeout=5000)
+                market_price_text = market_price_section.inner_text(timeout=5000)
+
                 # 华东数据
-                huadong_el = active_page.locator("text=华东").first
-                huadong_text = huadong_el.locator("xpath=..").inner_text()
-                lines = huadong_text.split("\n")
-                huadong_price = lines[1].strip() if len(lines) > 1 else "未知"
-                huadong_change = lines[2].strip() if len(lines) > 2 else "未知"
+                huadong_price, huadong_change = extract_market_price_from_section(
+                    market_price_text, "华东"
+                )
                 result["huadong"] = {"price": huadong_price, "change": huadong_change}
 
                 # 华南数据
-                huanan_el = active_page.locator("text=华南").first
-                huanan_text = huanan_el.locator("xpath=..").inner_text()
-                lines_hn = huanan_text.split("\n")
-                huanan_price = lines_hn[1].strip() if len(lines_hn) > 1 else "未知"
-                huanan_change = lines_hn[2].strip() if len(lines_hn) > 2 else "未知"
+                huanan_price, huanan_change = extract_market_price_from_section(
+                    market_price_text, "华南"
+                )
                 result["huanan"] = {"price": huanan_price, "change": huanan_change}
 
                 print(

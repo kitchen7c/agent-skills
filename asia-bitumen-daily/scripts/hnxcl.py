@@ -169,9 +169,19 @@ def determine_exit_code(exc):
 def score_publication_candidate(candidate, target_date):
     text = (candidate.get("text") or "").lower()
     score = 0
+    if "asia bitumen daily:" in text:
+        score += 14
+    elif "asia bitumen daily" in text:
+        score += 10
     for token, weight in PUBLICATION_SEMANTIC_TOKENS:
         if token in text:
             score += weight
+    if "news & analysis" in text:
+        score -= 6
+    if "latest news" in text:
+        score -= 8
+    if "us-iran war" in text:
+        score -= 10
     if "argus asia bitumen daily" in text:
         score += 5
     if filename_matches_target_date(candidate.get("text", ""), target_date):
@@ -257,6 +267,37 @@ def extract_news_candidates_from_source_text(source_text, limit=3):
         if len(selected) >= limit:
             break
     return selected
+
+
+def article_text_looks_like_target_report(article_text):
+    text = (article_text or "").lower()
+    if "asia bitumen daily" not in text:
+        return False
+
+    bitumen_signals = sum(
+        1
+        for token in (
+            "singapore",
+            "south korea",
+            "bitumen",
+            "prices rise",
+            "prices fall",
+            "fob",
+            "buying interest",
+        )
+        if token in text
+    )
+    generic_news_signals = sum(
+        1
+        for token in (
+            "latest news",
+            "top headlines",
+            "round-up of the latest argus news stories",
+            "news & analysis",
+        )
+        if token in text
+    )
+    return bitumen_signals >= 3 and generic_news_signals == 0
 
 
 def select_publication_candidate(candidates, target_date):
@@ -949,6 +990,8 @@ class ArgusDownloader:
 
         if len(article_text) < 200:
             raise ArgusStageError("article_fallback", "文章回退失败: 页面正文提取长度不足")
+        if not article_text_looks_like_target_report(article_text):
+            raise ArgusStageError("article_fallback", "文章回退失败: 命中了非 Asia bitumen daily 正文页面")
 
         artifact_path = prepare_output_path(
             self.get_target_dir() / f"Argus_Asia_Bitumen_Daily_{target_date}_article_fallback.txt"

@@ -48,8 +48,8 @@ description: Use when the user asks to fetch, download, send, summarize, or push
    - 获取、发送并摘要
 
 2. 再确定投递目标：
-   - 如果当前通道能解析出钉钉用户标识，使用该标识
-   - 如果用户要求推送到钉钉，但当前上下文无法解析用户标识，停止发送流程并明确报缺少投递目标
+   - 如果当前通道能解析出一个或多个钉钉用户标识，使用这些标识
+   - 如果用户要求推送到钉钉，但当前上下文无法解析任何用户标识，停止发送流程并明确报缺少投递目标
    - 不要把硬编码默认工号当作 skill 规范
 
 3. 再解析输出目录：
@@ -63,13 +63,13 @@ description: Use when the user asks to fetch, download, send, summarize, or push
 5. 通过统一入口执行脚本：
 
 ```bash
-bash scripts/run_hnxcl_uv.sh --method get_asia_bitumen_daily --user_id <resolved_user_id> --output-dir "<resolved_output_dir>"
+bash scripts/run_hnxcl_uv.sh --method get_asia_bitumen_daily --user_id "<resolved_user_ids>" --output-dir "<resolved_output_dir>"
 ```
 
 或直接使用：
 
 ```bash
-uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id <resolved_user_id> --output-dir "<resolved_output_dir>"
+uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id "<resolved_user_ids>" --output-dir "<resolved_output_dir>"
 ```
 
 如果上下文未解析出目录，则省略 `--output-dir` 参数。

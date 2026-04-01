@@ -259,6 +259,22 @@ def has_meaningful_value(value):
     return text not in {"", "-", "未知", "None", "null"}
 
 
+def parse_target_user_ids(raw_user_ids):
+    if raw_user_ids is None:
+        return []
+    if isinstance(raw_user_ids, (list, tuple, set)):
+        values = raw_user_ids
+    else:
+        values = [raw_user_ids]
+
+    result = []
+    for value in values:
+        for part in re.split(r"[,，;\s]+", str(value or "").strip()):
+            if part:
+                result.append(part)
+    return result
+
+
 def extract_market_price_snapshot(card_text, region_label):
     lines = [
         line.strip()
@@ -826,13 +842,17 @@ def normalize_report_data(report_data, today_date, prices=None):
     }
 
 
-def send_pdf_to_dingtalk(file_path, target_user_id="42706"):
-    """将文件推送到指定的钉钉用户"""
+def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
+    """将文件推送到一个或多个钉钉用户"""
     client_id = get_required_env("DINGTALK_APP_KEY")
     client_secret = get_required_env("DINGTALK_APP_SECRET")
+    user_id_list = parse_target_user_ids(target_user_ids)
+    if not user_id_list:
+        print("未提供有效的钉钉用户ID，跳过发送。")
+        return False
 
     try:
-        print(f"开始推送文件到钉钉，目标用户: {target_user_id}...")
+        print(f"开始推送文件到钉钉，目标用户: {', '.join(user_id_list)}...")
 
         # 1. 获取 OAPI Access Token
         oapi_url = f"https://oapi.dingtalk.com/gettoken?appkey={client_id}&appsecret={client_secret}"
@@ -874,7 +894,7 @@ def send_pdf_to_dingtalk(file_path, target_user_id="42706"):
 
         body = {
             "robotCode": client_id,
-            "userIds": [target_user_id],
+            "userIds": user_id_list,
             "msgKey": "sampleFile",
             "msgParam": json.dumps(msg_param),
         }
@@ -899,7 +919,7 @@ def send_pdf_to_dingtalk(file_path, target_user_id="42706"):
 class ArgusDownloader:
     def __init__(self, headless=True, target_user_id="42706", output_dir=None):
         self.headless = headless
-        self.target_user_id = target_user_id
+        self.target_user_ids = parse_target_user_ids(target_user_id)
         self.output_dir = ensure_output_dir(output_dir)
         self.p = None
         self.browser = None
@@ -1504,7 +1524,7 @@ JSON schema:
             print(f"-> 中文版 PDF 生成成功，已保存至: {new_pdf_path}")
 
             # 推送生成的 PDF 给指定用户
-            delivered = send_pdf_to_dingtalk(str(new_pdf_path), self.target_user_id)
+            delivered = send_pdf_to_dingtalk(str(new_pdf_path), self.target_user_ids)
             if delivered is False:
                 self.add_warning("delivery", "钉钉发送未成功，但 PDF 已生成")
 

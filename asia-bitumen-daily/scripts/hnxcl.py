@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from playwright.sync_api import sync_playwright
 import fitz  # PyMuPDF，用于读取PDF内容
 from openai import OpenAI  # 用于调用大模型
@@ -140,10 +141,10 @@ class FetchResult:
     source_type: str
     source_name: str
     source_report_date: str = "-"
-    pdf_path: Path | None = None
-    artifact_path: Path | None = None
-    text_content: str | None = None
-    fallback_reason: str | None = None
+    pdf_path: Optional[Path] = None
+    artifact_path: Optional[Path] = None
+    text_content: Optional[str] = None
+    fallback_reason: Optional[str] = None
 
 
 class ArgusStageError(RuntimeError):

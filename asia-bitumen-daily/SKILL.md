@@ -63,7 +63,13 @@ description: Use when the user asks to fetch, download, send, summarize, or push
 5. 通过统一入口执行脚本：
 
 ```bash
-python3 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id <resolved_user_id> --output-dir "<resolved_output_dir>"
+bash scripts/run_hnxcl_uv.sh --method get_asia_bitumen_daily --user_id <resolved_user_id> --output-dir "<resolved_output_dir>"
+```
+
+或直接使用：
+
+```bash
+uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id <resolved_user_id> --output-dir "<resolved_output_dir>"
 ```
 
 如果上下文未解析出目录，则省略 `--output-dir` 参数。

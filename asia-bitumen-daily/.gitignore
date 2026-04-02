@@ -3,5 +3,6 @@ __pycache__/
 .DS_Store
 .agents/
 test_hnxcl_fonts.py
+tests/test_report_normalization.py
 reports/
 .env.example

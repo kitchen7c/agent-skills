@@ -202,14 +202,14 @@ def score_publication_candidate(candidate, target_date):
     return score
 
 
-def normalize_status_display(status):
+def normalize_status_display(status, label=None):
     raw = str(status or "").strip()
     if not raw or raw == "-":
         return "-"
 
     compact = raw.replace(" ", "")
     if "持平" in compact:
-        return "-"
+        return "持平"
 
     sign = None
     if any(token in compact for token in ("上涨", "上升", "增加", "+", "▲")):
@@ -226,14 +226,52 @@ def normalize_status_display(status):
     if numbers:
         value = numbers[0].rstrip("0").rstrip(".") if "." in numbers[0] else numbers[0]
         if sign:
-            return f"{sign}{value}"
+            currency_symbol = detect_currency_symbol(label)
+            if currency_symbol:
+                return f"{sign} {currency_symbol}{value}"
+            return f"{sign} {value}"
 
     if sign:
         return sign
     return raw
 
 
-def normalize_price_display(value):
+def format_status_from_delta(delta):
+    try:
+        delta_value = float(delta)
+    except (TypeError, ValueError):
+        return "-"
+
+    if abs(delta_value) < 1e-9:
+        return "持平"
+
+    normalized = f"{abs(delta_value):f}".rstrip("0").rstrip(".")
+    if delta_value > 0:
+        return f"▲ {normalized}"
+    return f"▼ {normalized}"
+
+
+def compute_status_from_chart_item(item):
+    try:
+        previous = float(item.get("previous", 0) or 0)
+        current = float(item.get("current", 0) or 0)
+    except (TypeError, ValueError, AttributeError):
+        return "-"
+    return format_status_from_delta(current - previous)
+
+
+def detect_currency_symbol(label):
+    text = str(label or "").strip()
+    if not text:
+        return ""
+    if any(token in text for token in ("FOB", "ABX", "新加坡", "韩国", "伊朗", "离岸")):
+        return "$"
+    if any(token in text for token in ("上海主力", "BU主力", "华东", "华南")):
+        return "¥"
+    return ""
+
+
+def normalize_price_display(value, label=None):
     raw = str(value).strip() if value is not None else "-"
     if not raw or raw == "-":
         return "-"
@@ -246,12 +284,28 @@ def normalize_price_display(value):
         .strip()
     )
     compact = raw.replace(",", "").replace(" ", "")
+    currency_symbol = detect_currency_symbol(label)
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", compact):
         numeric = f"{float(compact):f}"
-        return numeric.rstrip("0").rstrip(".")
+        normalized = numeric.rstrip("0").rstrip(".")
+        if currency_symbol:
+            return f"{currency_symbol}{normalized}/吨"
+        return normalized
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?-[-+]?\d+(?:\.\d+)?", compact):
-        return raw
+        normalized = compact
+        if currency_symbol:
+            return f"{currency_symbol}{normalized}/吨"
+        return normalized
     return raw
+
+
+def format_price_html(price_text):
+    text = str(price_text or "").strip()
+    if not text or text == "-":
+        return html.escape(text or "-")
+    if text.endswith("/吨"):
+        return f'{html.escape(text[:-2])}<span class="unit-text">/吨</span>'
+    return html.escape(text)
 
 
 def has_meaningful_value(value):
@@ -626,15 +680,17 @@ def _render_paragraphs(paragraphs):
 def _render_price_strip_items(items):
     blocks = []
     for item in items[:5]:
-        status_text = normalize_status_display(item.get("status", "-"))
+        status_text = normalize_status_display(
+            item.get("status", "-"), label=item.get("label")
+        )
         status_class = status_css_class(status_text)
-        value_text = normalize_price_display(item.get("value", "-"))
+        value_text = normalize_price_display(item.get("value", "-"), label=item.get("label"))
         blocks.append(
             "\n".join(
                 [
                     '<div class="price-item">',
                     f'    <div class="item-label">{html.escape(item.get("label", "-"))}</div>',
-                    f'    <div class="item-val">{html.escape(value_text)}</div>',
+                    f'    <div class="item-val">{format_price_html(value_text)}</div>',
                     f'    <div class="item-status {status_class}">{html.escape(status_text)}</div>',
                     "</div>",
                 ]
@@ -741,12 +797,17 @@ def _render_forecasts(items):
 def render_report_template(template_html, report_data):
     """使用固定模板渲染报告，避免模型输出任意 HTML/CSS。"""
     chart = report_data.get("chart", {})
-    main_price_status = report_data.get("main_price_status", "")
+    main_price_status = normalize_status_display(
+        report_data.get("main_price_status", ""),
+        label=report_data.get("contract", ""),
+    )
     main_price_status_class = status_css_class(main_price_status)
     tokens = {
         "{{REPORT_DATE}}": html.escape(report_data.get("report_date", "")),
         "{{CONTRACT}}": html.escape(report_data.get("contract", "")),
-        "{{MAIN_PRICE}}": html.escape(normalize_price_display(report_data.get("main_price", ""))),
+        "{{MAIN_PRICE}}": (
+            f'<span class="price-main-value">{format_price_html(normalize_price_display(report_data.get("main_price", ""), label=report_data.get("contract", "")))}</span>'
+        ),
         "{{MAIN_PRICE_STATUS_HTML}}": f'<span class="{main_price_status_class}">{html.escape(main_price_status)}</span>',
         "{{PRICE_STRIP_ITEMS}}": _render_price_strip_items(report_data.get("price_strip", [])),
         "{{MARKET_SUMMARY_HTML}}": _render_paragraphs(report_data.get("market_summary", [])),
@@ -805,6 +866,25 @@ def normalize_report_data(report_data, today_date, prices=None):
     while len(chart_items) < 3:
         chart_items.append({"label": "-", "previous": 0, "current": 0})
 
+    chart_status_map = {}
+    for item in chart_items:
+        label = str(item.get("label", "")).strip()
+        status = compute_status_from_chart_item(item)
+        if label:
+            chart_status_map[label] = status
+
+    strip_status_aliases = {
+        "FOB 新加坡 (ABX 1)": "新加坡 ABX 1",
+        "FOB 韩国 (ABX 2)": "韩国离岸价",
+        "FOB 伊朗 (散装)": "伊朗散装价",
+    }
+    for item in price_strip:
+        if has_meaningful_value(item.get("status")):
+            continue
+        chart_label = strip_status_aliases.get(item.get("label"))
+        if chart_label and has_meaningful_value(chart_status_map.get(chart_label)):
+            item["status"] = chart_status_map[chart_label]
+
     def ensure_items(items, count):
         normalized = list(items[:count])
         while len(normalized) < count:
@@ -817,13 +897,24 @@ def normalize_report_data(report_data, today_date, prices=None):
             {"title": "-", "price_range": "-", "support": "-", "resistance": "-"}
         )
 
+    main_price_status = normalize_status_display(
+        report_data.get("main_price_status", ""),
+        label=report_data.get("contract", ""),
+    )
+    if not has_meaningful_value(main_price_status):
+        for preferred_label in ("新加坡 ABX 1", "韩国离岸价", "伊朗散装价"):
+            candidate = chart_status_map.get(preferred_label)
+            if has_meaningful_value(candidate):
+                main_price_status = normalize_status_display(
+                    candidate, label=report_data.get("contract", "")
+                )
+                break
+
     return {
         "report_date": report_data.get("report_date", today_date),
         "contract": report_data.get("contract", "上海主力合约 (BU主力)"),
         "main_price": report_data.get("main_price", "-"),
-        "main_price_status": normalize_status_display(
-            report_data.get("main_price_status", "")
-        ),
+        "main_price_status": main_price_status,
         "price_strip": price_strip,
         "market_summary": report_data.get("market_summary", []),
         "trade_dynamics": report_data.get("trade_dynamics", []),
@@ -1373,6 +1464,9 @@ class ArgusDownloader:
 9. `chart.items` 固定返回 3 条，分别对应新加坡、韩国、伊朗；数值字段返回数字。
 10. 报告日期使用 `{today_date}`。
 11. 今日隆众沥青市场价格参考如下，请合并到 `price_strip` 中的“华东地区批发”“华南地区批发”项：{price_info}
+12. `main_price` 与 `main_price_status` 必须填写上海主力合约的价格与相对前一交易日变动；若原文表述为持平，`main_price_status` 填 `持平`。
+13. `price_strip` 中前 3 项必须填写 FOB 新加坡、韩国、伊朗的价格与相对前一日变动；`status` 统一填写 `▲数字`、`▼数字` 或 `持平`，不要留 `-`，除非原文完全没有该项数据。
+14. `chart.previous_date` 必须填写前一交易日日期；`chart.items.current` 与 `chart.items.previous` 必须与前 3 项 FOB 价格变化保持一致。
 
 候选行业动态原文：
 {news_candidates_prompt}

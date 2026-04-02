@@ -102,7 +102,6 @@
         }
 
         .price-main {
-            font-size: 48px;
             font-weight: bold;
             color: #333;
             line-height: 1;
@@ -111,11 +110,28 @@
             justify-content: flex-end;
         }
 
-        .price-main span {
+        .price-main > span {
             font-size: 20px;
             margin-left: 8px;
             color: #888;
             font-weight: normal;
+        }
+
+        .price-main .price-main-value {
+            font-size: 40px;
+            color: #333;
+            font-weight: bold;
+            margin-left: 0;
+        }
+
+        .unit-text {
+            font-size: 70%;
+        }
+
+        .price-main .price-main-value .unit-text {
+            margin-left: 0;
+            color: inherit;
+            font-weight: inherit;
         }
 
         /* Price Strip */

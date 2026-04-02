@@ -211,6 +211,14 @@ def normalize_status_display(status, label=None):
     if "持平" in compact:
         return "持平"
 
+    numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", compact)
+    if numbers:
+        try:
+            if all(abs(float(number)) < 1e-9 for number in numbers):
+                return "持平"
+        except ValueError:
+            pass
+
     sign = None
     if any(token in compact for token in ("上涨", "上升", "增加", "+", "▲")):
         sign = "▲"

@@ -13,7 +13,7 @@
 | `history` | 历史价格序列 | 必填 |
 | `forecast` | 主观判断输入 | 必填 |
 | `strategies` | 期货与期权策略定义 | 必填 |
-| `chain` | 公开期权链 | 可选，存在则优先判定 Mode A |
+| `chain` | 公开期权链 | 可选，只有满足 Mode A 覆盖要求时才进入 Black-76 |
 | `proxy_option_surface` | 代理波动率面 | Mode B 必填 |
 
 ## `market`
@@ -71,7 +71,7 @@
 | 字段 | 含义 |
 | --- | --- |
 | `direction` | `偏多` / `中性偏震荡` / `偏空` |
-| `median_72h_target` | 72 小时中位目标 |
+| `median_72h_target` | 72 小时中位目标 | 用作 72 小时分布锚，报告中必须标注为 `推断` |
 | `event_risk_regime` | `low` / `moderate` / `elevated` |
 | `narrow_band_width` | 可选，若不填则脚本按波动率自动生成 |
 | `thesis` | 结论摘要 |
@@ -135,18 +135,20 @@ Mode B 下，这些 strike 默认解释为：
 
 ### `chain`
 
-若存在 `chain.options`，并且每条记录至少有：
+若存在 `chain.options`，并且在同一到期上满足以下覆盖要求：
 
 - `strike`
 - `option_type`
 - `expiry`
 - `price` 或 `iv`
+- 至少 2 个不同 strike
+- 至少 2 个完整双边 strike（同一 strike 同时有 call 与 put）
 
-则脚本会优先进入 `Black-76 执行模式`。
+只有满足以上条件，脚本才会进入 `Black-76 执行模式`。若 `strategies.options.expiry` 已填写，则必须与该到期对齐。
 
 ### `proxy_option_surface`
 
-若 `chain` 不可用，则必须提供：
+若 `chain` 不可用，或 `chain` 覆盖不足以支撑逐 strike 分析，则必须提供：
 
 - `expiry`
 - `atm_iv`

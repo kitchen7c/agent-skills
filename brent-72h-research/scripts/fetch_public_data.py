@@ -23,6 +23,80 @@ PLACEHOLDER_HOSTS = {
     "127.0.0.1",
     "0.0.0.0",
 }
+MODE_A_MIN_STRIKES = 2
+
+
+def evaluate_mode_a_chain(
+    chain: dict | None, preferred_expiry: str | None = None
+) -> tuple[bool, list[str], str | None]:
+    if not chain:
+        return False, ["未提供 chain"], None
+
+    options = chain.get("options", [])
+    if not options:
+        return False, ["chain.options 为空，无法进入 Mode A"], None
+
+    valid_by_expiry: dict[str, list[dict]] = {}
+    structural_errors: list[str] = []
+    for idx, item in enumerate(options):
+        missing = [
+            field
+            for field in ["strike", "option_type", "expiry"]
+            if field not in item or item[field] in ("", None)
+        ]
+        if missing:
+            structural_errors.append(
+                f"chain.options[{idx}] 缺少字段 {', '.join(missing)}"
+            )
+            continue
+        if "price" not in item and "iv" not in item:
+            structural_errors.append(
+                f"chain.options[{idx}] 必须至少包含 price 或 iv"
+            )
+            continue
+        expiry = str(item["expiry"])
+        valid_by_expiry.setdefault(expiry, []).append(item)
+
+    if structural_errors:
+        return False, structural_errors, None
+
+    expiries = [preferred_expiry] if preferred_expiry else sorted(valid_by_expiry)
+    if preferred_expiry and preferred_expiry not in valid_by_expiry:
+        return (
+            False,
+            [f"chain.options 缺少与策略到期 {preferred_expiry} 对齐的记录，无法进入 Mode A"],
+            None,
+        )
+
+    best_reason = "chain.options 不足以支撑 Mode A strike-level analysis"
+    for expiry in expiries:
+        items = valid_by_expiry.get(expiry, [])
+        strikes: dict[float, set[str]] = {}
+        for item in items:
+            strike = float(item["strike"])
+            option_type = str(item["option_type"]).lower()
+            strikes.setdefault(strike, set()).add(option_type)
+
+        strike_count = len(strikes)
+        fully_paired_strikes = sum(
+            1 for option_types in strikes.values() if {"call", "put"} <= option_types
+        )
+        option_types = set().union(*strikes.values()) if strikes else set()
+
+        if (
+            strike_count >= MODE_A_MIN_STRIKES
+            and fully_paired_strikes >= MODE_A_MIN_STRIKES
+            and {"call", "put"} <= option_types
+        ):
+            return True, [], expiry
+
+        best_reason = (
+            f"chain.options 在到期 {expiry} 仅覆盖 {strike_count} 个 strike，"
+            f"其中完整双边 strike 为 {fully_paired_strikes} 个，"
+            "不足以支撑 Mode A strike-level analysis"
+        )
+
+    return False, [best_reason], None
 
 
 def load_json(path: Path) -> dict:
@@ -188,6 +262,8 @@ def validate_snapshot(
         errors.append("forecast.direction 必须为 偏多 / 中性偏震荡 / 偏空")
     if "median_72h_target" not in forecast:
         errors.append("forecast.median_72h_target 缺失")
+    elif not isinstance(forecast.get("median_72h_target"), (int, float)):
+        errors.append("forecast.median_72h_target 必须为数值")
 
     strategies = snapshot.get("strategies", {})
     if "futures" not in strategies:
@@ -201,18 +277,29 @@ def validate_snapshot(
         errors.append("必须至少提供 chain 或 proxy_option_surface 之一，用于模式判定")
 
     if chain:
-        options = chain.get("options", [])
-        if not options:
-            errors.append("chain.options 为空，无法进入 Mode A")
-        else:
-            for item in options:
-                if "strike" not in item or "option_type" not in item or "expiry" not in item:
-                    errors.append("chain.options 每条记录必须包含 strike、option_type、expiry")
-                    break
-                if "price" not in item and "iv" not in item:
-                    errors.append("chain.options 每条记录必须至少包含 price 或 iv")
-                    break
-    else:
+        preferred_expiry = strategies.get("options", {}).get("expiry")
+        chain_supported, chain_issues, _ = evaluate_mode_a_chain(
+            chain,
+            preferred_expiry=str(preferred_expiry) if preferred_expiry else None,
+        )
+        if not chain_supported:
+            if proxy_surface:
+                warnings.extend(chain_issues)
+                warnings.append("chain 不满足 Mode A 覆盖要求，本次将回退到 Mode B")
+            else:
+                errors.extend(chain_issues)
+
+    if not chain or (
+        chain
+        and not evaluate_mode_a_chain(
+            chain,
+            preferred_expiry=(
+                str(strategies.get("options", {}).get("expiry"))
+                if strategies.get("options", {}).get("expiry")
+                else None
+            ),
+        )[0]
+    ):
         atm_iv = proxy_surface.get("atm_iv") if proxy_surface else None
         if not isinstance(atm_iv, (int, float)):
             errors.append("Mode B 需要 proxy_option_surface.atm_iv")

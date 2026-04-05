@@ -14,6 +14,12 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.fetch_public_data import evaluate_mode_a_chain
+
 
 ACT_365 = 365.0
 TRADING_DAYS = 252.0
@@ -237,6 +243,22 @@ def build_curve_text(m2: float, m3: float, m4: float) -> tuple[str, float, float
     return "mixed", spread_23, spread_34
 
 
+def describe_curve_state(curve_state: str) -> str:
+    return {
+        "backwardation": "反向市场（backwardation）",
+        "contango": "正向市场（contango）",
+        "mixed": "混合结构",
+    }[curve_state]
+
+
+def describe_event_risk(level: str) -> str:
+    return {
+        "low": "低",
+        "moderate": "中等",
+        "elevated": "高",
+    }.get(level, str(level))
+
+
 def derive_skew_from_proxy(surface: dict[str, Any]) -> float:
     skew = surface["skew_proxy"]
     return float(skew["call25_iv"]) - float(skew["put25_iv"])
@@ -284,6 +306,13 @@ class Engine:
         self.t_horizon = self.horizon_hours / 24.0 / ACT_365
         self.paths = int(payload.get("monte_carlo_paths", DEFAULT_PATHS))
         self.seed = int(payload.get("monte_carlo_seed", DEFAULT_SEED))
+        preferred_expiry = self.strategies.get("options", {}).get("expiry")
+        self.mode_a_supported, self.mode_a_failures, self.mode_a_expiry = (
+            evaluate_mode_a_chain(
+                self.payload.get("chain"),
+                preferred_expiry=str(preferred_expiry) if preferred_expiry else None,
+            )
+        )
         self.mode = self.determine_mode()
         self.reference_key = self.select_reference_key()
         self.reference = float(self.contracts[self.reference_key]["used_price"])
@@ -297,21 +326,15 @@ class Engine:
         self.option_model = "black76" if self.mode == "Black-76 执行模式" else "bsm"
 
     def determine_mode(self) -> str:
-        chain = self.payload.get("chain")
-        if chain and chain.get("options"):
-            for item in chain["options"]:
-                if (
-                    "strike" in item
-                    and "option_type" in item
-                    and "expiry" in item
-                    and ("price" in item or "iv" in item)
-                ):
-                    return "Black-76 执行模式"
+        if self.mode_a_supported:
+            return "Black-76 执行模式"
         return "BSM 代理模式"
 
     def determine_expiry(self) -> str:
         if self.mode == "Black-76 执行模式":
-            return str(self.payload["chain"]["options"][0]["expiry"])
+            if not self.mode_a_expiry:
+                raise ValueError("Mode A 缺少可对齐 expiry")
+            return str(self.mode_a_expiry)
         return str(self.payload["proxy_option_surface"]["expiry"])
 
     def select_reference_key(self) -> str:
@@ -394,12 +417,16 @@ class Engine:
         return format_pct(call25[2] - put25[2])
 
     def simulate_prices(self, sigma: float) -> list[float]:
+        target = float(self.forecast["median_72h_target"])
+        if target <= 0:
+            raise ValueError("forecast.median_72h_target 必须大于 0")
+        mu = (math.log(target / self.reference) / self.t_horizon) + 0.5 * sigma * sigma
         rng = random.Random(self.seed)
         prices: list[float] = []
         for _ in range(self.paths):
             z = rng.gauss(0.0, 1.0)
             price = self.reference * math.exp(
-                (self.r - 0.5 * sigma * sigma) * self.t_horizon
+                (mu - 0.5 * sigma * sigma) * self.t_horizon
                 + sigma * math.sqrt(self.t_horizon) * z
             )
             prices.append(price)
@@ -673,6 +700,9 @@ class Engine:
         )
 
         self.self_check(option_stats, futures_ladder)
+        inferred_target = float(self.forecast["median_72h_target"])
+        curve_label = describe_curve_state(curve_state)
+        event_risk_label = describe_event_risk(self.forecast["event_risk_regime"])
 
         regime = (
             "期权偏贵"
@@ -682,23 +712,30 @@ class Engine:
             else "期权偏便宜"
         )
         sentiment = (
-            "panic-priced"
+            "恐慌定价"
             if atm_iv > max(hv20 * 1.45, 0.45)
-            else "fairly priced"
+            else "大致公允定价"
             if atm_iv > hv20 * 0.9
-            else "complacent"
+            else "偏松弛定价"
         )
-        narrow_label = "真高概率窄区间" if narrow_prob >= 0.15 else "最高密度窄区间"
+        narrow_label = "高概率窄区间" if narrow_prob >= 0.15 else "最高密度窄区间"
         skew_text = self.compute_skew_proxy()
         mode_reason = (
-            "公开期权链具备 expiry、strike、option side 与价格/IV 字段，满足 Black-76 对齐条件。"
+            f"公开期权链在到期 {self.expiry} 至少覆盖两个完整双边 strike，满足 Black-76 对齐条件。"
             if self.mode == "Black-76 执行模式"
-            else "公开 Brent 期货期权链不足以支持逐 strike 可验证分析，改用 BSM 代理模式。"
+            else (
+                f"公开 Brent 期货期权链 公开源不可得或覆盖不足：{self.mode_a_failures[0]}，改用 BSM 代理模式。"
+                if self.mode_a_failures
+                else "公开 Brent 期货期权链 公开源不可得或覆盖不足，改用 BSM 代理模式。"
+            )
         )
 
         sources = self.collect_sources()
         catalysts = self.market.get("jump_catalysts", [])
-        scenarios = self.build_scenarios(option_stats)
+        scenarios = self.build_scenarios(option_stats, legs_out)
+        curve_trade_note = self.build_curve_trade_evaluation(
+            curve_state, spread_23, spread_34, vrp
+        )
 
         lines: list[str] = []
         lines.append("1. 【战术执行摘要 | 72H Tactical Summary】")
@@ -716,6 +753,10 @@ class Engine:
             "2. 【底层数据与精准时间戳对齐 | Market Microstructure Data & Timestamp Validation】"
         )
         lines.append("")
+        lines.append(
+            f"- 本次层级使用：Brent M+2/M+3/M+4 采用公开期货月合约价格；"
+            f"{'期权链采用公开 Brent 期货期权链' if self.mode == 'Black-76 执行模式' else '期权部分采用 Brent 价格代理 + BSM 波动率面'}；OVX 仅作 WTI-linked 代理指标。"
+        )
         for key in ["m2", "m3", "m4"]:
             contract = self.contracts[key]
             lines.append(
@@ -741,7 +782,7 @@ class Engine:
         )
         lines.append(
             f"- 期限结构：M+2-M+3 = {format_num(spread_23)}，M+3-M+4 = {format_num(spread_34)}，"
-            f"曲线状态为 {curve_state}。"
+            f"曲线状态为 {curve_label}。"
         )
         for catalyst in catalysts:
             lines.append(
@@ -751,7 +792,7 @@ class Engine:
         lines.append(f"- 模式选择理由：{mode_reason}")
         if self.mode == "BSM 代理模式":
             lines.append(
-                "- 模式限制：这是 proxy-model 报告，执行价不代表实时可成交盘口。"
+                "- 模式限制：这是代理模型报告，执行价不代表实时可成交盘口，Greeks 与 VaR 仅对应模型化执行位。"
             )
         lines.append("")
         lines.append(
@@ -765,23 +806,30 @@ class Engine:
         lines.append(f"- 市场情绪：{sentiment}。")
         lines.append(f"- Skew / skew proxy：{skew_text}。")
         lines.append(
-            f"- 期限结构与方向：{curve_state} 说明近端供需更紧或更松，这与方向结论 {self.forecast['direction']} 的一致性为 推断。"
+            f"- 期限结构与方向：{curve_label} 说明近端供需更紧或更松，这与方向结论 {self.forecast['direction']} 的一致性为 推断。"
         )
         lines.append(
             f"- 定位与事件：定位口径为 {'代理指标' if positioning.get('proxy') else '原生数据'}，"
             f"需与跳跃催化联合解释，不能单独视作交易触发。"
         )
         lines.append(
-            f"- 事件风险：{self.forecast['event_risk_regime']}。若 IV 高于 HV 但事件风险偏高，short premium 只能视作收益/跳空风险交换，不可表述为安全。"
+            f"- 事件风险：{event_risk_label}。若 IV 高于 HV 且事件风险偏高，short premium 只能视作收益/跳空风险交换，不可表述为安全。"
         )
+        lines.append(f"- 曲线交易评估：{curve_trade_note}")
         lines.append("")
         lines.append(
             "4. 【72小时量价预测：核心打靶区与尾部置信区间 | 72H Price Projection: Target Zone & Tail Intervals】"
         )
         lines.append("")
         lines.append(
+            f"- 72 小时推断中位目标：{format_num(inferred_target)}（推断）。"
+        )
+        lines.append(
             f"- 窄区间：{format_num(narrow_band[0])} - {format_num(narrow_band[1])}，实际概率质量 {format_pct(narrow_prob)}，"
             f"定义为 {narrow_label}。"
+        )
+        lines.append(
+            f"- 窄区间宽度：{format_num(narrow_width)}，由 72 小时波动尺度 {format_num(sigma_move)} 推导，属于波动率感知区间。"
         )
         lines.append(f"- HDI 50%：{format_num(hdi50[0])} - {format_num(hdi50[1])}。")
         lines.append(f"- HDI 68%：{format_num(hdi68[0])} - {format_num(hdi68[1])}。")
@@ -793,8 +841,7 @@ class Engine:
             "因此基于对数正态假设的 Monte Carlo 对上尾尖峰的低估风险必须视为已知限制，属于 推断。"
         )
         lines.append(
-            "- 漂移说明：本模拟采用风险中性漂移（r），窄区间宽度反映波动率驱动的随机分布，"
-            "中位目标仅用于方向判断参考，不代表风险中性概率下的预期价格。"
+            "- 漂移说明：本模拟以 72 小时推断中位目标为分布锚，窄区间、HDI、68% 与 95% 区间共用同一组 IV、到期日、乘数与随机种子。"
         )
         lines.append("")
         lines.append("5. 【期货与期权联合策略 | Futures & Options Strategy】")
@@ -825,7 +872,7 @@ class Engine:
             f"估计盈利概率 {format_pct(option_stats['pop'])}。"
         )
         option_legs_desc = "；".join(
-            f"{leg.label} ({format_num(leg.strike)} {leg.option_type})"
+            f"{leg.label}（{format_num(leg.strike)}，{'看涨期权' if leg.option_type == 'call' else '看跌期权'}）"
             for leg in legs_out
         )
         lines.append(f"- 期权腿：{option_legs_desc}。")
@@ -836,7 +883,7 @@ class Engine:
             "- 当盘中流动性充足且方向确认强化时，优先期货；当跨夜、事件窗或跳空风险上升时，优先期权。"
         )
         lines.append(
-            "- 在当前假设下最匹配的结构，是因为其方向暴露、尾部损失上限和 72 小时事件窗更一致。"
+            f"- 在当前假设下最匹配的结构，是因为其方向暴露、尾部损失上限、VRP={format_pct(vrp)} 与 {event_risk_label} 事件窗更一致。"
         )
         if self.mode == "BSM 代理模式":
             lines.append("- 以上执行价为模型化执行位，不代表实时可成交盘口。")
@@ -907,10 +954,10 @@ class Engine:
             f"- 99% CVaR（每标准手）：{format_num(option_stats['cvar99'])} 美元。"
         )
         lines.append(
-            "- 注：以上为单一价差结构的每手风险敞口，实际风险需乘以实际持仓手数，不适用于 paper trade 场景。"
+            "- 注：以上为单一价差结构的每手风险敞口，实际风险需乘以实际持仓手数，不适用于仅做观点展示的模拟盘场景。"
         )
         lines.append(
-            f"- Fat-Tail Geopolitical Spike（标的 +15%）压力测试：{format_num(option_stats['stress']['+15%'])} 美元。"
+            f"- 地缘政治胖尾上冲（标的 +15%）压力测试：{format_num(option_stats['stress']['+15%'])} 美元。"
         )
         lines.append(
             f"- 标的 +10% 压力测试：{format_num(option_stats['stress']['+10%'])} 美元。"
@@ -925,7 +972,7 @@ class Engine:
         lines.append("")
         lines.append("9. 【附录：专业术语名词定义 | Glossary】")
         lines.append("")
-        lines.extend(self.build_glossary())
+        lines.extend(self.build_glossary(curve_state, narrow_label))
         lines.append("")
         lines.append("【Sources】")
         lines.append("")
@@ -933,11 +980,31 @@ class Engine:
             lines.append(f"- {source['name']}: {source['url']}")
         return "\n".join(lines).strip() + "\n"
 
-    def build_scenarios(self, option_stats: dict[str, Any]) -> list[dict[str, str]]:
+    def build_curve_trade_evaluation(
+        self, curve_state: str, spread_23: float, spread_34: float, vrp: float
+    ) -> str:
+        total_curve_slope = abs(spread_23) + abs(spread_34)
+        futures = self.strategies["futures"]
+        if total_curve_slope < 0.60:
+            return "近远月价差未达到极端阈值，本次不把跨期价差作为主策略。"
+        if futures["type"] == "calendar_spread":
+            return (
+                f"当前 {describe_curve_state(curve_state)} 的两段价差合计 {format_num(total_curve_slope)}，"
+                "滚动收益与期限收敛逻辑足以支持将跨期价差设为主策略。"
+            )
+        return (
+            f"当前 {describe_curve_state(curve_state)} 的两段价差合计 {format_num(total_curve_slope)}，"
+            f"已评估跨期价差作为主策略候选；但结合 VRP={format_pct(vrp)} 与既定方向仓位后，"
+            f"本次仍保留 {futures['name']} 为主执行路径。"
+        )
+
+    def build_scenarios(
+        self, option_stats: dict[str, Any], legs_out: list[OptionLegResult]
+    ) -> list[dict[str, str]]:
         futures = self.strategies["futures"]
         lower = float(futures["invalidation"])
         upper = float(futures["targets"][0])
-        return [
+        scenarios = [
             {
                 "title": f"失效位测试 {format_num(lower)}",
                 "why": "这是方向假设最早被证伪的位置。",
@@ -955,8 +1022,25 @@ class Engine:
                 "portfolio_action": "保留少量尾仓跟踪第二目标，否则平掉大部分 Delta 暴露。",
             },
         ]
+        if is_bounded_structure(self.strategies["options"]["legs"]) and legs_out:
+            strikes = sorted(item.strike for item in legs_out)
+            option_type = legs_out[0].option_type
+            saturation_level = max(strikes) if option_type == "call" else min(strikes)
+            scenarios.append(
+                {
+                    "title": f"价差封顶区测试 {format_num(saturation_level)}",
+                    "why": "这是有限风险价差开始接近收益饱和的关键几何点位。",
+                    "regime": "若价格逼近该位，市场将从方向验证切换为收益兑现与滚动决策。",
+                    "futures_action": "期货不宜继续线性加仓，应优先把新增风险留给更远执行位。",
+                    "options_action": "价差将逐步进入收益封顶区，继续持有的边际收益下降，应评估减仓、平仓或向更远 strike 滚动。",
+                    "portfolio_action": "若事件风险仍高，保留少量有限风险仓位并把剩余头寸滚动到更远执行价；否则以兑现为主。",
+                }
+            )
+        return scenarios
 
-    def build_glossary(self) -> list[str]:
+    def build_glossary(self, curve_state: str, narrow_label: str) -> list[str]:
+        curve_term = describe_curve_state(curve_state)
+        mode_term = self.mode
         rows = [
             (
                 "HV(20D)",
@@ -985,14 +1069,9 @@ class Engine:
                 "用于描述尾部风险范围。",
             ),
             (
-                "backwardation",
-                "近月价格高于远月价格的期限结构。",
-                "用于判断近端供需紧张程度。",
-            ),
-            (
-                "contango",
-                "远月价格高于近月价格的期限结构。",
-                "用于判断库存与持有成本压力。",
+                curve_term,
+                "Brent 近远月之间的期限结构状态。",
+                "用于判断近端供需紧张度与是否需要评估跨期交易。",
             ),
             (
                 "OVX",
@@ -1000,9 +1079,9 @@ class Engine:
                 "本报告中仅作为 代理指标 使用，不代表 Brent 原生波动率。",
             ),
             (
-                "PoP",
-                "基于蒙特卡洛模拟的盈利概率（Probability of Profit）。",
-                "在 72 小时截面的理论价值分布中，正收益路径占比。属于理论值，未考虑实际交易中的提前止盈/止损与时间衰减。",
+                mode_term,
+                "本次期权定价与 Greeks 所使用的模型模式。",
+                "用于说明执行位是否来自公开链，还是来自代理模型。",
             ),
             (
                 "Delta",
@@ -1044,6 +1123,11 @@ class Engine:
                 "并非目标市场原生数据，而是用于替代参考的相关指标。",
                 "标识 Brent 不可直接公开获取时的替代口径。",
             ),
+            (
+                narrow_label,
+                "72 小时内在固定宽度下承载最多概率质量的交易区间标签。",
+                "用于区分可称为高概率的区间与仅能称为最高密度窄区间的区间。",
+            ),
         ]
         lines = ["| term | definition | role in this report |", "| --- | --- | --- |"]
         for term, definition, role in rows:
@@ -1053,6 +1137,12 @@ class Engine:
     def collect_sources(self) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         seen: set[str] = set()
+        chain = self.payload.get("chain", {})
+        chain_url = chain.get("source_url")
+        chain_name = chain.get("source_name")
+        if chain_url and chain_url not in seen:
+            result.append({"name": chain_name, "url": chain_url})
+            seen.add(chain_url)
         for contract in self.contracts.values():
             for key in ["used_source_url"]:
                 url = contract.get(key)
@@ -1088,6 +1178,10 @@ class Engine:
             failures.append("contract multiplier 非法")
         if self.t_exp <= 0 or self.t_horizon <= 0:
             failures.append("到期或 horizon 非法")
+        if self.mode == "Black-76 执行模式" and not self.mode_a_supported:
+            failures.append("Mode A 覆盖不足")
+        if float(self.forecast["median_72h_target"]) <= 0:
+            failures.append("median_72h_target 非法")
         max_loss_text = option_stats["max_loss_text"]
         if max_loss_text != "公开源不可得":
             max_loss = float(max_loss_text)

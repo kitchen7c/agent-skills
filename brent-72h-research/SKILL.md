@@ -160,6 +160,8 @@ agent-browser --session bc-greeks wait 5000
 - strike
 - option side
 - option price 或 implied volatility
+- 同一到期上至少 2 个不同 strike
+- 同一到期上至少 2 个完整双边 strike（同一 strike 同时可见 call 与 put）
 
 若满足，则：
 
@@ -297,6 +299,8 @@ python3 scripts/run_report.py --input /tmp/brent_snapshot.json --output /tmp/bre
 - Monte Carlo 至少 `100000` 路径
 - 随机种子固定
 - 期货、期权、区间、Greeks、压力测试必须共用同一底层参考与到期锚点
+- `forecast.median_72h_target` 必须作为 72 小时分布锚，并在报告中显式标注为 `推断`
+- 窄区间宽度必须是波动率感知的，不能默认写死成单一常数而不给解释
 
 ## Self-Check Gate
 
@@ -308,6 +312,8 @@ python3 scripts/run_report.py --input /tmp/brent_snapshot.json --output /tmp/bre
 - 99% VaR 或 99% CVaR 超过理论最大亏损
 - 压力测试结果与理论最大亏损不一致
 - 把低概率窄区间误写成高概率区间
+- Black-76 模式下，公开链覆盖不足以支撑逐 strike 分析
+- 报告正文残留英文情绪标签或未标记的代理/推断口径
 
 若校验失败，量化脚本会输出：
 
@@ -331,6 +337,7 @@ python3 scripts/run_report.py --input /tmp/brent_snapshot.json --output /tmp/bre
 - 把 spot HV 拿去替代远月合约 HV 而不标注
 - 把 OVX 当成 Brent 原生波动率而不标 `代理指标`
 - 链路不可得时仍假装自己有实时可成交 strike 与 Greeks
+- 只要看到几条期权记录就误判进入 `Black-76 执行模式`
 - 期货和期权分别用不同底层价格
 - 把 Barchart `IV = 0.00%` 的行误当成真实隐含波动率
 - 把 Barchart `historical-prices` 合约汇总页误写成单一合约 20 日日线

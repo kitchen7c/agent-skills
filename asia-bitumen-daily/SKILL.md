@@ -53,7 +53,8 @@ description: Use when the user asks to fetch, download, send, summarize, or push
    - 不要把硬编码默认工号当作 skill 规范
 
 3. 再解析输出目录：
-   - 如果当前上下文明确给出了目标目录路径，使用该目录作为报告产物目录
+   - 如果当前上下文明确给出了目标目录路径，把它视为输出根目录；最终产物目录固定使用“运行当天日期”命名
+   - 如果传入的目录本身已经是运行当天日期目录，则直接使用该目录
    - 只解析“目录路径”，不要把任意字符串误判成路径
    - 如果目录不存在，可先创建目录；创建失败则按“产物生成失败”处理
    - 如果上下文没有给出目录，则回退到脚本默认路径
@@ -76,6 +77,14 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 
 如果当前请求只是“获取”而不是“发送”，但现有实现仍要求走同一入口完成报告生成，则继续使用该入口。
 
+运行入口约束：
+
+- 优先使用 `bash scripts/run_hnxcl_uv.sh ...`
+- 不要假设 runtime 中存在 `pyproject.toml` 或 `uv.lock`
+- Python 依赖以 `scripts/requirements-hnxcl.txt` 为准，由启动脚本通过 `uv run --with-requirements` 解析
+- 如果执行环境没有可用的 Playwright 浏览器二进制，先执行 `bash scripts/bootstrap_hnxcl_uv.sh`
+- `scripts/bootstrap_hnxcl_uv.sh` 负责安装 `chromium`，随后再执行主流程
+
 6. 只有同时满足以下条件，才可视为执行成功：
    - 进程正常退出
    - 生成了预期的 PDF 产物
@@ -88,7 +97,7 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 
 - 以脚本的实际输出为准
 - 执行后检查是否生成了新的 PDF 文件
-- 如果本次请求指定了输出目录，优先在该目录内校验产物
+- 如果本次请求指定了输出目录，优先在“输出根目录/运行当天日期目录”内校验产物
 - 区分两类产物：
   - 原始下载的源 PDF
   - 后处理生成的中文版或下游 PDF
@@ -148,6 +157,9 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 本 skill 依赖以下本地实现和运行条件：
 
 - `scripts/hnxcl.py`
+- `scripts/run_hnxcl_uv.sh`
+- `scripts/bootstrap_hnxcl_uv.sh`
+- `scripts/requirements-hnxcl.txt`
 - 脚本所需的浏览器自动化运行环境
 - Argus 报告源访问能力
 - 钉钉接口凭证和发送权限
@@ -156,6 +168,9 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 ## 文件说明
 
 - `scripts/hnxcl.py`：报告获取与生成的统一入口
+- `scripts/bootstrap_hnxcl_uv.sh`：初始化 runtime 依赖并安装 Playwright Chromium
+- `scripts/run_hnxcl_uv.sh`：最小可运行启动入口，不依赖根目录项目元数据
+- `scripts/requirements-hnxcl.txt`：runtime 自包含 Python 依赖清单
 - `scripts/hnxcl.html`：报告生成流程使用的 HTML 模板
 - `scripts/ding.ts`：钉钉通道集成参考实现
 

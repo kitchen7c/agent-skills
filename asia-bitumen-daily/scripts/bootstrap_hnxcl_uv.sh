@@ -12,13 +12,10 @@ if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
   exit 1
 fi
 
-# Paperclip skill runtimes may omit pyproject.toml and use a restricted home dir.
-# Keep the launcher self-contained by resolving dependencies from scripts/.
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 mkdir -p "${UV_CACHE_DIR}"
 
 exec uv run \
   --python 3.11 \
   --with-requirements "${REQUIREMENTS_FILE}" \
-  scripts/hnxcl.py \
-  "$@"
+  python -m playwright install chromium

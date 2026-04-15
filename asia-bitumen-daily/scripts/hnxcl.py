@@ -80,9 +80,7 @@ def ensure_output_dir(output_dir):
     """规范化并确保输出目录存在。"""
     if not output_dir:
         return None
-    normalized_dir = os.path.abspath(os.path.expanduser(output_dir))
-    os.makedirs(normalized_dir, exist_ok=True)
-    return normalized_dir
+    return os.path.abspath(os.path.expanduser(output_dir))
 
 
 def prepare_output_path(path_like):
@@ -1100,11 +1098,26 @@ class ArgusDownloader:
         return datetime.now().strftime("%Y%m%d")
 
     @staticmethod
+    def current_run_dir_name():
+        return datetime.now().strftime("%Y-%m-%d")
+
+    @staticmethod
     def expected_argus_report_date():
         return argus_expected_report_date(datetime.now())
 
     def get_target_dir(self):
-        return Path(self.output_dir or os.getcwd())
+        run_dir_name = self.current_run_dir_name()
+        if self.output_dir:
+            output_path = Path(self.output_dir)
+            if output_path.name in {run_dir_name, self.current_report_date()}:
+                target_dir = output_path
+            else:
+                target_dir = output_path / run_dir_name
+        else:
+            target_dir = Path(os.getcwd()) / run_dir_name
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir
 
     def capture_debug_artifacts(self, stage, error_message):
         """在失败阶段保存页面证据，便于后续排障。"""
@@ -2074,7 +2087,7 @@ def main():
         "--output-dir",
         type=str,
         default=None,
-        help="指定报告输出目录；源 PDF 和生成后的 PDF 都会写入该目录",
+        help="指定报告输出根目录；源 PDF 和生成后的 PDF 会写入其中的运行当天日期目录（若传入的已是当天日期目录则直接使用）",
     )
 
     args = parser.parse_args()

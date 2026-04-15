@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import requests
 import json
 import base64
 import mimetypes
@@ -12,9 +11,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
-from playwright.sync_api import sync_playwright
-import fitz  # PyMuPDF，用于读取PDF内容
-from openai import OpenAI  # 用于调用大模型
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -74,6 +70,38 @@ def get_required_env(name):
     if value:
         return value
     raise RuntimeError(f"缺少必需环境变量: {name}")
+
+
+def import_requests():
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少依赖 requests，请先安装 requests") from exc
+    return requests
+
+
+def import_playwright_sync():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少依赖 playwright，请先安装 playwright") from exc
+    return sync_playwright
+
+
+def import_pymupdf():
+    try:
+        import fitz
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少依赖 PyMuPDF，请先安装 PyMuPDF") from exc
+    return fitz
+
+
+def import_openai_client():
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少依赖 openai，请先安装 openai") from exc
+    return OpenAI
 
 
 def ensure_output_dir(output_dir):
@@ -1007,6 +1035,7 @@ def normalize_report_data(report_data, today_date, prices=None):
 
 def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
     """将文件推送到一个或多个钉钉用户"""
+    requests = import_requests()
     client_id = get_required_env("DINGTALK_APP_KEY")
     client_secret = get_required_env("DINGTALK_APP_SECRET")
     user_id_list = parse_target_user_ids(target_user_ids)
@@ -1368,6 +1397,7 @@ class ArgusDownloader:
         return is_report_date_within_lag(candidate_date, target_date)
 
     def build_requests_session_from_browser(self):
+        requests = import_requests()
         session = requests.Session()
 
         try:
@@ -1578,6 +1608,7 @@ class ArgusDownloader:
 
     def start_browser(self):
         """启动浏览器并进行基础设置"""
+        sync_playwright = import_playwright_sync()
         self.p = sync_playwright().start()
         # 添加 args=['--start-maximized'] 配合 no_viewport=True 使浏览器窗口最大化（全屏）
         self.browser = self.p.chromium.launch(headless=True, args=["--start-maximized"])
@@ -1680,6 +1711,7 @@ class ArgusDownloader:
 
     def generate_chinese_report(self, pdf_path, prices=None, fetch_result=None):
         """读取 PDF 内容并继续进入统一的中文报告生成流程。"""
+        fitz = import_pymupdf()
         print("\n=== 开始生成中文版报告 ===")
         print("1. 正在提取PDF文本内容...")
         source_pdf_name = os.path.basename(pdf_path)
@@ -1722,6 +1754,7 @@ class ArgusDownloader:
         model_name = os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite-preview")
 
         try:
+            OpenAI = import_openai_client()
             client = OpenAI(api_key=api_key, base_url=base_url)
 
             import base64

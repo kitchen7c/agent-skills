@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 import fitz  # PyMuPDF，用于读取PDF内容
 from openai import OpenAI  # 用于调用大模型
@@ -64,6 +65,8 @@ NEWS_SENTENCE_HINTS = (
     "import",
     "sanction",
 )
+DEFAULT_ARGUS_PUBLICATION_ID = "291"
+MAX_REPORT_LAG_DAYS = 7
 
 
 def get_required_env(name):
@@ -137,6 +140,51 @@ def extract_report_date_from_filename(filename):
     return "-"
 
 
+def extract_report_date_compact(text):
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    compact_match = re.search(r"(20\d{6})", raw)
+    if compact_match:
+        return compact_match.group(1)
+
+    dashed_match = re.search(r"(20\d{2}-\d{2}-\d{2})", raw)
+    if dashed_match:
+        return datetime.strptime(dashed_match.group(1), "%Y-%m-%d").strftime("%Y%m%d")
+
+    month_match = re.search(r"(\d{2}-[A-Za-z]{3}-20\d{2})", raw)
+    if month_match:
+        return datetime.strptime(month_match.group(1), "%d-%b-%Y").strftime("%Y%m%d")
+
+    return None
+
+
+def is_report_date_within_lag(candidate_date, target_date, max_lag_days=MAX_REPORT_LAG_DAYS):
+    if not candidate_date or not target_date:
+        return False
+
+    try:
+        candidate_dt = datetime.strptime(candidate_date, "%Y%m%d")
+        target_dt = datetime.strptime(target_date, "%Y%m%d")
+    except ValueError:
+        return False
+
+    lag_days = (target_dt - candidate_dt).days
+    return 0 <= lag_days <= max_lag_days
+
+
+def report_date_lag_days(candidate_date, target_date):
+    if not candidate_date or not target_date:
+        return None
+    try:
+        candidate_dt = datetime.strptime(candidate_date, "%Y%m%d")
+        target_dt = datetime.strptime(target_date, "%Y%m%d")
+    except ValueError:
+        return None
+    return (target_dt - candidate_dt).days
+
+
 def build_generated_report_stem(current_date_cn):
     compact = current_date_cn.replace("年", "").replace("月", "").replace("日", "")
     return f"Argus_Asia_Bitumen_Daily_{compact}"
@@ -197,8 +245,15 @@ def score_publication_candidate(candidate, target_date):
         score -= 10
     if "argus asia bitumen daily" in text:
         score += 5
+    candidate_date = extract_report_date_compact(candidate.get("text", ""))
     if filename_matches_target_date(candidate.get("text", ""), target_date):
         score += 8
+    elif is_report_date_within_lag(candidate_date, target_date):
+        lag_days = report_date_lag_days(candidate_date, target_date)
+        if lag_days is not None:
+            score += max(1, 6 - lag_days)
+    elif candidate_date:
+        score -= 8
     return score
 
 
@@ -493,9 +548,20 @@ def select_publication_candidate(candidates, target_date):
     if not candidates:
         return None
 
+    def lag_rank(candidate):
+        lag = report_date_lag_days(
+            extract_report_date_compact(candidate.get("text", "")), target_date
+        )
+        return -999 if lag is None else -lag
+
     ranked = sorted(
         candidates,
-        key=lambda candidate: (score_publication_candidate(candidate, target_date), candidates.index(candidate)),
+        key=lambda candidate: (
+            score_publication_candidate(candidate, target_date),
+            1 if filename_matches_target_date(candidate.get("text", ""), target_date) else 0,
+            lag_rank(candidate),
+            -candidates.index(candidate),
+        ),
     )
     best = ranked[-1]
     if score_publication_candidate(best, target_date) <= 0:
@@ -1025,6 +1091,9 @@ class ArgusDownloader:
         self.context = None
         self.page = None
         self.warnings = []
+        self.publication_id = os.environ.get(
+            "ARGUS_ASIA_BITUMEN_PUBLICATION_ID", DEFAULT_ARGUS_PUBLICATION_ID
+        )
 
     @staticmethod
     def current_report_date():
@@ -1064,6 +1133,8 @@ class ArgusDownloader:
                         "stage": stage,
                         "error": error_message,
                         "url": self.page.url,
+                        "title": self.page.title() if self.page else "",
+                        "frames": [frame.url for frame in self.page.frames] if self.page else [],
                         "captured_at": datetime.now().isoformat(),
                     },
                     ensure_ascii=False,
@@ -1083,11 +1154,45 @@ class ArgusDownloader:
         print(f"[warning][{stage}] {message}")
         return warning
 
-    def _click_candidate_for_article(self, candidate):
+    def _extract_candidate_title(self, candidate):
+        text = candidate.get("text") or ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        for line in reversed(lines):
+            if re.search(r"[A-Za-z]", line):
+                return line
+        return lines[-1]
+
+    def _resolve_candidate_interactive_row(self, candidate):
         row = candidate["row"]
+        title = self._extract_candidate_title(candidate)
+
+        strategies = [
+            lambda: self.page.locator("li.publication-item").filter(has_text=title).first,
+            lambda: self.page.locator(".preview-row").filter(has_text=title).first,
+            lambda: row.locator("xpath=ancestor-or-self::*[contains(@class, 'preview-row')][1]").first,
+            lambda: row.locator("xpath=ancestor-or-self::*[contains(@class, 'publication-item')][1]").first,
+            lambda: row,
+        ]
+
+        for factory in strategies:
+            try:
+                resolved = factory()
+                resolved.wait_for(state="attached", timeout=3000)
+                return resolved
+            except Exception:
+                continue
+        return row
+
+    def _click_candidate_for_article(self, candidate):
+        row = self._resolve_candidate_interactive_row(candidate)
         click_targets = [
+            lambda: row.locator("#publication-link").first,
+            lambda: row.locator("a.publication-item-link[href*='publicationId']").first,
             lambda: row.get_by_role("link", name=re.compile(r"Argus Asia Bitumen Daily", re.I)).first,
             lambda: row.get_by_text("Argus Asia Bitumen Daily").first,
+            lambda: row.locator(".title, .preview-row .title").first,
             lambda: row.locator("a, button").first,
         ]
         last_error = None
@@ -1106,25 +1211,54 @@ class ArgusDownloader:
         raise RuntimeError(f"无法打开文章页: {last_error}")
 
     def _click_candidate_for_pdf(self, candidate):
-        row = candidate["row"]
+        row = self._resolve_candidate_interactive_row(candidate)
         click_targets = [
+            lambda: row.locator("#pdf-link").first,
+            lambda: row.locator("a.publication-item-link").filter(has_text=re.compile(r"^PDF$", re.I)).first,
             lambda: row.get_by_role("link", name=re.compile(r"PDF|Download", re.I)).first,
             lambda: row.get_by_role("button", name=re.compile(r"PDF|Download", re.I)).first,
             lambda: row.get_by_text(re.compile(r"PDF|Download", re.I)).first,
             lambda: row.locator("a, button").filter(has_text=re.compile(r"PDF|Download", re.I)).first,
+            lambda: row.locator(".download").first,
+            lambda: row.locator("fa-icon.download").first,
+            lambda: row.locator("[data-icon='download']").first,
+            lambda: row.locator("svg[data-icon='download']").first,
         ]
         last_error = None
         for factory in click_targets:
             try:
                 target = factory()
-                target.click(timeout=5000)
+                target.wait_for(state="attached", timeout=3000)
+                try:
+                    target.click(timeout=5000)
+                except Exception:
+                    target.click(timeout=5000, force=True)
                 return
             except Exception as exc:
                 last_error = exc
         raise RuntimeError(f"无法点击 PDF/Download 动作: {last_error}")
 
+    def ensure_markets_publications_view(self):
+        """优先进入 markets 页面下的 Publications 列表，因为该页面存在稳定的 publication-item 结构。"""
+        if "/markets" not in self.page.url:
+            self.page.goto("https://direct.argusmedia.com/markets")
+            self.page.wait_for_load_state("load")
+        self.page.wait_for_timeout(1200)
+        try:
+            self.page.locator(".scrollable-menu-container li.publication-item").first.wait_for(
+                state="attached", timeout=8000
+            )
+            return "markets_publications"
+        except Exception:
+            return None
+
     def open_publications_menu(self):
         """使用多套定位策略打开 Publications 菜单。"""
+        markets_mode = self.ensure_markets_publications_view()
+        if markets_mode:
+            print(f"已进入 Publications 列表视图: {markets_mode}")
+            return markets_mode
+
         strategies = [
             ("role_button", lambda: self.page.get_by_role("button", name=re.compile(r"Publications", re.I)).first),
             ("role_link", lambda: self.page.get_by_role("link", name=re.compile(r"Publications", re.I)).first),
@@ -1146,11 +1280,17 @@ class ArgusDownloader:
 
         raise ArgusStageError("publications_download", f"无法定位 Publications 菜单: {last_error}")
 
-    def collect_publication_candidates(self):
+    def collect_publication_candidates(self, target_date):
         """按语义枚举与目标刊物相关的候选节点，兼容新版页面结构变化。"""
-        rows = self.page.locator("div, li, tr, article, section").filter(
-            has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I)
-        )
+        publication_menu_rows = self.page.locator(
+            ".scrollable-menu-container li.publication-item"
+        ).filter(has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I))
+        if publication_menu_rows.count():
+            rows = publication_menu_rows
+        else:
+            rows = self.page.locator("div, li, tr, article, section").filter(
+                has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I)
+            )
         count = min(rows.count(), 60)
         candidates = []
         seen_texts = set()
@@ -1162,7 +1302,7 @@ class ArgusDownloader:
                 continue
             if not text or text in seen_texts:
                 continue
-            score = score_publication_candidate({"text": text}, self.current_report_date())
+            score = score_publication_candidate({"text": text}, target_date)
             if score <= 0:
                 continue
             seen_texts.add(text)
@@ -1195,34 +1335,167 @@ class ArgusDownloader:
         return None
 
     def find_today_report_download(self, target_date):
-        candidates = self.collect_publication_candidates()
+        candidates = self.collect_publication_candidates(target_date)
         selected = select_publication_candidate(candidates, target_date)
         if not selected:
             return None
         with self.page.expect_download() as download_info:
-            selected["row"].get_by_text("PDF", exact=True).first.click()
+            self._click_candidate_for_pdf(selected)
         return download_info.value
+
+    def is_expected_report_file(self, file_path, target_date):
+        path = Path(file_path)
+        if not path.exists() or path.suffix.lower() != ".pdf":
+            return False
+
+        if filename_matches_target_date(path.name, target_date):
+            return True
+
+        candidate_date = extract_report_date_compact(path.name)
+        return is_report_date_within_lag(candidate_date, target_date)
+
+    def build_requests_session_from_browser(self):
+        session = requests.Session()
+
+        try:
+            cookies = self.context.cookies()
+        except Exception as exc:
+            raise ArgusStageError("article_fallback", f"读取浏览器会话 Cookie 失败: {exc}") from exc
+
+        for cookie in cookies:
+            try:
+                session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie.get("domain"),
+                    path=cookie.get("path", "/"),
+                )
+            except Exception:
+                continue
+
+        try:
+            user_agent = self.page.evaluate("() => navigator.userAgent")
+        except Exception:
+            user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+            )
+
+        session.headers.update(
+            {
+                "User-Agent": user_agent,
+                "Accept": "text/html,application/pdf,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+        )
+        return session
+
+    def fetch_publication_pdf_via_http_fallback(self, target_date, fallback_reason):
+        print(f"进入认证 HTTP 回退流程，原因: {fallback_reason}")
+        session = self.build_requests_session_from_browser()
+
+        seed_urls = [
+            f"https://direct.argusmedia.com/publication?publicationId={self.publication_id}",
+            f"https://direct.argusmedia.com/integration/publication?publicationId={self.publication_id}",
+        ]
+        pending_urls = list(seed_urls)
+        attempted = set()
+
+        while pending_urls and len(attempted) < 8:
+            url = pending_urls.pop(0)
+            if url in attempted:
+                continue
+            attempted.add(url)
+
+            try:
+                response = session.get(url, timeout=30, allow_redirects=True)
+            except Exception as exc:
+                self.add_warning("article_fallback", f"HTTP 回退请求失败: {url} -> {exc}")
+                continue
+
+            final_url = str(response.url)
+            content_type = (response.headers.get("content-type") or "").lower()
+            body = response.content or b""
+
+            if "application/pdf" in content_type or body.startswith(b"%PDF-"):
+                file_name = (
+                    Path(urlparse(final_url).path).name
+                    or f"Argus Asia Bitumen Daily ({target_date}).pdf"
+                )
+                download_path = prepare_output_path(self.get_target_dir() / file_name)
+                download_path.write_bytes(body)
+
+                if not self.is_expected_report_file(download_path, target_date):
+                    raise ArgusStageError(
+                        "article_fallback",
+                        f"HTTP 回退下载到了非目标窗口内的 PDF: {download_path.name}",
+                    )
+
+                print(f"认证 HTTP 回退下载成功: {download_path}")
+                return FetchResult(
+                    source_type="argus_pdf",
+                    source_name=download_path.name,
+                    source_report_date=extract_report_date_from_filename(download_path.name),
+                    pdf_path=download_path,
+                    artifact_path=download_path,
+                    fallback_reason=fallback_reason,
+                )
+
+            html_text = response.text or ""
+            lowered = html_text.lower()
+            if any(token in lowered for token in ("my account", "sign in", "chrome-error")):
+                self.add_warning(
+                    "article_fallback",
+                    f"HTTP 回退命中认证/壳页面: {final_url}",
+                )
+                continue
+
+            discovered = []
+            for match in re.findall(r'(?:src|href)=["\']([^"\']+)["\']', html_text, flags=re.I):
+                absolute = urljoin(final_url, html.unescape(match))
+                if absolute in attempted or absolute in pending_urls:
+                    continue
+                if not any(
+                    token in absolute.lower()
+                    for token in (
+                        ".pdf",
+                        "publication",
+                        "download",
+                        "integration",
+                        "api",
+                    )
+                ):
+                    continue
+                discovered.append(absolute)
+
+            pending_urls.extend(discovered[:5])
+
+        raise ArgusStageError("article_fallback", "认证 HTTP 回退失败: 未解析到可下载 PDF")
 
     def download_publication_pdf(self, target_date):
         print("正在打开 Publications 菜单...")
         self.open_publications_menu()
-        self.page.wait_for_selector("text=Argus Asia Bitumen Daily", timeout=10000)
-        row = self.locate_publication_download_row()
-        row.wait_for(state="visible", timeout=5000)
-        print(f"准备下载候选项: {row.inner_text(timeout=3000).strip()}")
+        self.page.wait_for_timeout(1500)
+        candidates = self.collect_publication_candidates(target_date)
+        selected = select_publication_candidate(candidates, target_date)
+        if not selected:
+            raise ArgusStageError("publications_download", "未找到匹配的 Argus Asia Bitumen Daily 候选项")
+        print(f"准备下载候选项: {selected['text']}")
         try:
             with self.page.expect_download(timeout=15000) as download_info:
-                row.get_by_text("PDF", exact=True).first.click(timeout=5000)
+                self._click_candidate_for_pdf(selected)
             download = download_info.value
         except Exception as exc:
             raise ArgusStageError("publications_download", f"点击 PDF 下载失败: {exc}") from exc
 
-        file_name = download.suggested_filename
+        file_name = download.suggested_filename or f"Argus Asia Bitumen Daily ({target_date}).pdf"
         download_path = prepare_output_path(self.get_target_dir() / file_name)
         download.save_as(str(download_path))
 
-        if not is_current_report_file(download_path, target_date):
-            raise ArgusStageError("publications_download", f"下载的 PDF 日期不匹配: {download_path.name}")
+        if not self.is_expected_report_file(download_path, target_date):
+            raise ArgusStageError(
+                "publications_download",
+                f"下载的 PDF 不在允许日期窗口内: {download_path.name}",
+            )
 
         print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {download_path}")
         return FetchResult(
@@ -1359,8 +1632,14 @@ class ArgusDownloader:
                     target_date, primary_error or "Publications download failed"
                 )
             except Exception as exc:
+                self.add_warning("article_fallback", str(exc))
                 self.capture_debug_artifacts("article_fallback", str(exc))
-                raise
+
+        if fetch_result is None:
+            fetch_result = self.fetch_publication_pdf_via_http_fallback(
+                target_date,
+                primary_error or "Publications/article fallback failed",
+            )
 
         # 获取隆众沥青价格
         try:

@@ -82,8 +82,8 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 - 优先使用 `bash scripts/run_hnxcl_uv.sh ...`
 - 不要假设 runtime 中存在 `pyproject.toml` 或 `uv.lock`
 - Python 依赖以 `scripts/requirements-hnxcl.txt` 为准，由启动脚本通过 `uv run --with-requirements` 解析
-- 如果执行环境没有可用的 Playwright 浏览器二进制，先执行 `bash scripts/bootstrap_hnxcl_uv.sh`
-- `scripts/bootstrap_hnxcl_uv.sh` 负责安装 `chromium`，随后再执行主流程
+- 如果执行环境没有可用的 `agent-browser` 浏览器运行时，先执行 `bash scripts/bootstrap_hnxcl_uv.sh`
+- `scripts/bootstrap_hnxcl_uv.sh` 负责安装 `agent-browser` 所需的 Chromium 运行时，随后再执行主流程
 
 6. 只有同时满足以下条件，才可视为执行成功：
    - 进程正常退出
@@ -168,7 +168,7 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 ## 文件说明
 
 - `scripts/hnxcl.py`：报告获取与生成的统一入口
-- `scripts/bootstrap_hnxcl_uv.sh`：初始化 runtime 依赖并安装 Playwright Chromium
+- `scripts/bootstrap_hnxcl_uv.sh`：初始化 `agent-browser` 运行时
 - `scripts/run_hnxcl_uv.sh`：最小可运行启动入口，不依赖根目录项目元数据
 - `scripts/requirements-hnxcl.txt`：runtime 自包含 Python 依赖清单
 - `scripts/hnxcl.html`：报告生成流程使用的 HTML 模板

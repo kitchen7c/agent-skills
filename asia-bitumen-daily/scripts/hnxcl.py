@@ -6,6 +6,9 @@ import base64
 import mimetypes
 import html
 import re
+import subprocess
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -63,6 +66,8 @@ NEWS_SENTENCE_HINTS = (
 )
 DEFAULT_ARGUS_PUBLICATION_ID = "291"
 MAX_REPORT_LAG_DAYS = 7
+AGENT_BROWSER_WAIT_MS = 1500
+AGENT_BROWSER_CAPTURE_TIMEOUT_SECONDS = 20
 
 
 def get_required_env(name):
@@ -78,14 +83,6 @@ def import_requests():
     except ModuleNotFoundError as exc:
         raise RuntimeError("缺少依赖 requests，请先安装 requests") from exc
     return requests
-
-
-def import_playwright_sync():
-    try:
-        from playwright.sync_api import sync_playwright
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("缺少依赖 playwright，请先安装 playwright") from exc
-    return sync_playwright
 
 
 def import_pymupdf():
@@ -766,6 +763,103 @@ def extract_filename_from_content_disposition(header_value):
     return None
 
 
+def resolve_agent_browser_executable_path():
+    explicit = os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH")
+    if explicit and Path(explicit).exists():
+        return explicit
+
+    candidate_roots = [
+        Path.home() / "Library" / "Caches" / "ms-playwright",
+        Path.home() / ".cache" / "ms-playwright",
+    ]
+    candidates = []
+    for root in candidate_roots:
+        if not root.exists():
+            continue
+        candidates.extend(
+            root.glob("chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell")
+        )
+        candidates.extend(root.glob("chromium-*/chrome-*/chrome"))
+
+    resolved = sorted(path for path in candidates if path.exists())
+    return str(resolved[-1]) if resolved else None
+
+
+def unpack_agent_browser_json(payload):
+    if isinstance(payload, dict) and "success" in payload:
+        data = payload.get("data")
+        if isinstance(data, dict) and "result" in data:
+            return data["result"]
+        return data
+    return payload
+
+
+def build_agent_browser_render_metrics_script():
+    return """
+(() => {
+  const container = document.getElementById('report-container') || document.body;
+  const rect = container.getBoundingClientRect();
+  const fontFamilies = Array.from(document.querySelectorAll('body, body *'))
+    .slice(0, 30)
+    .map((el) => window.getComputedStyle(el).fontFamily);
+  return {
+    title: document.title,
+    bodyFontFamily: window.getComputedStyle(document.body).fontFamily,
+    fontStatus: document.fonts ? document.fonts.status : 'unsupported',
+    sampleTextCheck: document.fonts
+      ? document.fonts.check('16px "Noto Sans SC Embedded"', '中文沥青价格测试')
+      : false,
+    containerWidth: Math.ceil(rect.width),
+    containerHeight: Math.ceil(container.scrollHeight),
+    fontFamilies,
+  };
+})();
+"""
+
+
+def build_agent_browser_image_prepare_script():
+    return """
+(() => {
+  const container = document.getElementById('report-container') || document.body;
+  const rect = container.getBoundingClientRect();
+  const width = Math.ceil(rect.width);
+  const height = Math.ceil(container.scrollHeight);
+  document.documentElement.style.background = '#ffffff';
+  document.body.style.background = '#ffffff';
+  document.body.style.margin = '0';
+  document.body.style.padding = '0';
+  document.body.style.width = `${width}px`;
+  document.body.style.minWidth = `${width}px`;
+  container.style.margin = '0';
+  return { width, height };
+})();
+"""
+
+
+def build_exact_link_href_script(link_text):
+    return f"""
+(() => {{
+  const target = {json.dumps(link_text)};
+  const links = Array.from(document.querySelectorAll('a'));
+  const match = links.find((link) => (link.innerText || '').trim() === target && link.href);
+  return match ? match.href : null;
+}})();
+"""
+
+
+def build_market_price_section_script():
+    return """
+(() => {
+  const sections = Array.from(document.querySelectorAll('div, section'));
+  const match = sections.find((section) => {
+    const text = (section.innerText || '').trim();
+    return /沥青市场价格|Market Price/i.test(text) && /华东/.test(text) && /华南/.test(text);
+  });
+  return match ? match.innerText : '';
+})();
+"""
+
+
 def compute_single_page_pdf_size(content_width_px, content_height_px, padding_px=80):
     width = max(900, int(content_width_px) + padding_px)
     height = max(1200, int(content_height_px) + padding_px)
@@ -877,6 +971,74 @@ def remove_pdf_ignored_elements(html_content):
         flags=re.DOTALL,
     )
     return html_content
+
+
+def render_html_image_via_agent_browser(
+    runner,
+    html_path,
+    output_image_path,
+    session_name,
+):
+    source_html_path = Path(html_path).resolve()
+    output_image_path = Path(output_image_path).resolve()
+
+    runner(
+        ["open", source_html_path.as_uri()],
+        timeout=60,
+        allow_file_access=True,
+        session=session_name,
+    )
+    for _ in range(20):
+        status = runner(
+            ["eval", "--stdin"],
+            json_output=True,
+            timeout=20,
+            stdin_text="document.fonts ? document.fonts.status : 'unsupported'",
+            allow_file_access=True,
+            session=session_name,
+        )
+        if status == "loaded":
+            break
+        runner(["wait", "500"], timeout=10, allow_file_access=True, session=session_name)
+
+    metrics = runner(
+        ["eval", "--stdin"],
+        json_output=True,
+        timeout=20,
+        stdin_text=build_agent_browser_render_metrics_script(),
+        allow_file_access=True,
+        session=session_name,
+    )
+    render_width, render_height = compute_single_page_pdf_size(
+        metrics["containerWidth"], metrics["containerHeight"]
+    )
+    prepared = runner(
+        ["eval", "--stdin"],
+        json_output=True,
+        timeout=20,
+        stdin_text=build_agent_browser_image_prepare_script(),
+        allow_file_access=True,
+        session=session_name,
+    )
+    prepared_width = int(prepared["width"])
+    prepared_height = int(prepared["height"])
+    runner(
+        ["set", "viewport", str(prepared_width), str(min(max(prepared_height, 900), 4000))],
+        timeout=20,
+        allow_file_access=True,
+        session=session_name,
+    )
+    runner(
+        ["screenshot", str(output_image_path)],
+        timeout=60,
+        allow_file_access=True,
+        session=session_name,
+        full_page=True,
+    )
+
+    metrics["imageSize"] = {"width": render_width, "height": render_height}
+    metrics["captureBox"] = {"width": prepared_width, "height": prepared_height}
+    return metrics
 
 
 def extract_json_payload(response_text):
@@ -1181,7 +1343,7 @@ def normalize_report_data(report_data, today_date, prices=None):
     }
 
 
-def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
+def send_file_to_dingtalk(file_path, target_user_ids="42706"):
     """将文件推送到一个或多个钉钉用户"""
     requests = import_requests()
     client_id = get_required_env("DINGTALK_APP_KEY")
@@ -1193,6 +1355,10 @@ def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
 
     try:
         print(f"开始推送文件到钉钉，目标用户: {', '.join(user_id_list)}...")
+        file_name = os.path.basename(file_path)
+        guessed_type, _ = mimetypes.guess_type(file_name)
+        mime_type = guessed_type or "application/octet-stream"
+        file_type = Path(file_name).suffix.lower().lstrip(".") or "file"
 
         # 1. 获取 OAPI Access Token
         oapi_url = f"https://oapi.dingtalk.com/gettoken?appkey={client_id}&appsecret={client_secret}"
@@ -1215,7 +1381,7 @@ def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
         # 3. 上传文件到钉钉媒体库
         upload_url = f"https://oapi.dingtalk.com/media/upload?access_token={oapi_token}&type=file"
         with open(file_path, "rb") as f:
-            files = {"media": (os.path.basename(file_path), f, "application/pdf")}
+            files = {"media": (file_name, f, mime_type)}
             upload_res = requests.post(upload_url, files=files).json()
 
         media_id = upload_res.get("media_id")
@@ -1228,8 +1394,8 @@ def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
         send_url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
         msg_param = {
             "mediaId": media_id,
-            "fileName": os.path.basename(file_path),
-            "fileType": "pdf",
+            "fileName": file_name,
+            "fileType": file_type,
         }
 
         body = {
@@ -1285,12 +1451,76 @@ class ArgusDownloader:
         self.verified_report_date = (
             verified_report_date or os.environ.get("ARGUS_VERIFIED_TEXT_DATE")
         )
+        self.agent_browser_executable_path = resolve_agent_browser_executable_path()
+        self.agent_browser_session = (
+            f"argus-publication-{self.publication_id}-{uuid.uuid4().hex[:8]}"
+        )
 
     def publication_entrypoint_url(self):
         return f"https://direct.argusmedia.com/publication?publicationId={self.publication_id}"
 
     def integration_publication_url(self):
         return f"https://direct.argusmedia.com/integration/publication?publicationId={self.publication_id}"
+
+    def _build_agent_browser_command(
+        self,
+        command_args,
+        json_output=False,
+        session=None,
+        allow_file_access=False,
+        full_page=False,
+    ):
+        command = ["agent-browser"]
+        if self.agent_browser_executable_path:
+            command.extend(["--executable-path", self.agent_browser_executable_path])
+        command.extend(["--session", session or self.agent_browser_session])
+        if allow_file_access:
+            command.append("--allow-file-access")
+        if full_page:
+            command.append("--full")
+        if json_output:
+            command.append("--json")
+        command.extend(command_args)
+        return command
+
+    def run_agent_browser(
+        self,
+        command_args,
+        *,
+        json_output=False,
+        timeout=60,
+        stdin_text=None,
+        allow_file_access=False,
+        session=None,
+        full_page=False,
+    ):
+        command = self._build_agent_browser_command(
+            command_args,
+            json_output=json_output,
+            allow_file_access=allow_file_access,
+            session=session,
+            full_page=full_page,
+        )
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            input=stdin_text,
+            timeout=timeout,
+        )
+        stdout = completed.stdout.strip()
+        if not json_output:
+            return stdout
+        if not stdout:
+            return None
+        return unpack_agent_browser_json(json.loads(stdout))
+
+    def agent_browser_eval(self, script, *, timeout=60):
+        return self.run_agent_browser(["eval", "--stdin"], json_output=True, timeout=timeout, stdin_text=script)
+
+    def agent_browser_wait(self, wait_target, *, timeout=60):
+        self.run_agent_browser(["wait", str(wait_target)], timeout=timeout)
 
     @staticmethod
     def current_report_date():
@@ -1366,141 +1596,6 @@ class ArgusDownloader:
         print(f"[warning][{stage}] {message}")
         return warning
 
-    def get_document_surfaces(self):
-        surfaces = iter_document_surfaces(self.page)
-
-        def surface_rank(surface):
-            url = self._surface_url(surface)
-            if url == self.integration_publication_url():
-                return (0, 0)
-            if url == self.publication_entrypoint_url():
-                return (1, 0)
-            if url and url != "about:blank":
-                return (2, 0)
-            return (3, 0)
-
-        return sorted(surfaces, key=surface_rank)
-
-    def _surface_url(self, surface):
-        return getattr(surface, "url", "") or ""
-
-    def _surface_matches_target_publication(self, surface):
-        return self._surface_url(surface) in {
-            self.publication_entrypoint_url(),
-            self.integration_publication_url(),
-        }
-
-    def _read_locator_text(self, locator):
-        try:
-            return locator.first.inner_text(timeout=2000).strip()
-        except Exception:
-            return ""
-
-    def _read_locator_value(self, locator):
-        try:
-            value = locator.first.input_value(timeout=1500)
-            if value:
-                return value.strip()
-        except Exception:
-            pass
-
-        try:
-            value = locator.first.get_attribute("value")
-            if value:
-                return value.strip()
-        except Exception:
-            pass
-
-        return ""
-
-    def _get_direct_publication_metadata(self, surface):
-        if not self._surface_matches_target_publication(surface):
-            return None
-
-        try:
-            surface.locator("#pdf-button").first.wait_for(state="attached", timeout=3000)
-        except Exception:
-            return None
-
-        heading = self._read_locator_text(surface.locator("#publication-preview").locator("h2"))
-        if not heading:
-            heading = self._read_locator_text(surface.locator("h2"))
-        if not heading or "argus asia bitumen daily" not in heading.lower():
-            heading = "Argus Asia Bitumen Daily"
-
-        date_text = ""
-        for selector in ("#date-picker", "#alt-date", "input.date-input"):
-            date_text = self._read_locator_value(surface.locator(selector))
-            if date_text:
-                break
-
-        preview_text = self._read_locator_text(surface.locator("#publication-preview"))
-        return {
-            "heading": heading,
-            "date_text": date_text,
-            "preview_text": preview_text,
-        }
-
-    def _collect_direct_publication_candidate(self, surface, target_date):
-        metadata = self._get_direct_publication_metadata(surface)
-        if not metadata:
-            return None
-        preview = surface.locator("#publication-preview")
-        heading = metadata["heading"]
-        date_text = metadata["date_text"]
-        preview_text = metadata["preview_text"] or heading
-        candidate_text = "\n".join(
-            part for part in (heading, "Download PDF", date_text, preview_text) if part
-        )
-        score = score_publication_candidate({"text": candidate_text}, target_date)
-        if score <= 0:
-            return None
-
-        return {
-            "row": preview.first,
-            "text": candidate_text,
-            "score": score,
-            "surface": surface,
-            "surface_url": self._surface_url(surface),
-        }
-
-    def _collect_surface_candidates(self, surface, target_date):
-        direct_candidate = self._collect_direct_publication_candidate(surface, target_date)
-        if direct_candidate:
-            return [direct_candidate]
-
-        publication_menu_rows = surface.locator(
-            ".scrollable-menu-container li.publication-item"
-        ).filter(has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I))
-        if publication_menu_rows.count():
-            rows = publication_menu_rows
-        else:
-            rows = surface.locator("div, li, tr, article, section").filter(
-                has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I)
-            )
-
-        count = min(rows.count(), 60)
-        candidates = []
-        for index in range(count):
-            row = rows.nth(index)
-            try:
-                text = row.inner_text(timeout=2000).strip()
-            except Exception:
-                continue
-            score = score_publication_candidate({"text": text}, target_date)
-            if not text or score <= 0:
-                continue
-            candidates.append(
-                {
-                    "row": row,
-                    "text": text,
-                    "score": score,
-                    "surface": surface,
-                    "surface_url": self._surface_url(surface),
-                }
-            )
-        return candidates
-
     def load_explicit_verified_text_fallback(self, fallback_reason):
         if not self.verified_text_path:
             return None
@@ -1529,178 +1624,6 @@ class ArgusDownloader:
                 return line
         return lines[-1]
 
-    def _resolve_candidate_interactive_row(self, candidate):
-        row = candidate["row"]
-        surface = candidate.get("surface") or self.page
-        title = self._extract_candidate_title(candidate)
-
-        strategies = [
-            lambda: surface.locator("li.publication-item").filter(has_text=title).first,
-            lambda: surface.locator(".preview-row").filter(has_text=title).first,
-            lambda: row.locator("xpath=ancestor-or-self::*[contains(@class, 'preview-row')][1]").first,
-            lambda: row.locator("xpath=ancestor-or-self::*[contains(@class, 'publication-item')][1]").first,
-            lambda: row,
-        ]
-
-        for factory in strategies:
-            try:
-                resolved = factory()
-                resolved.wait_for(state="attached", timeout=3000)
-                return resolved
-            except Exception:
-                continue
-        return row
-
-    def _click_candidate_for_article(self, candidate):
-        row = self._resolve_candidate_interactive_row(candidate)
-        click_targets = [
-            lambda: row.locator("#publication-link").first,
-            lambda: row.locator("a.publication-item-link[href*='publicationId']").first,
-            lambda: row.get_by_role("link", name=re.compile(r"Argus Asia Bitumen Daily", re.I)).first,
-            lambda: row.get_by_text("Argus Asia Bitumen Daily").first,
-            lambda: row.locator(".title, .preview-row .title").first,
-            lambda: row.locator("a, button").first,
-        ]
-        last_error = None
-        for factory in click_targets:
-            try:
-                target = factory()
-                target.click(timeout=5000)
-                return
-            except Exception as exc:
-                last_error = exc
-        try:
-            row.click(timeout=5000)
-            return
-        except Exception as exc:
-            last_error = exc
-        raise RuntimeError(f"无法打开文章页: {last_error}")
-
-    def _click_candidate_for_pdf(self, candidate):
-        row = self._resolve_candidate_interactive_row(candidate)
-        click_targets = [
-            lambda: row.locator("#pdf-link").first,
-            lambda: row.locator("#pdf-button").first,
-            lambda: row.locator("a.publication-item-link").filter(has_text=re.compile(r"^PDF$", re.I)).first,
-            lambda: row.get_by_role("link", name=re.compile(r"PDF|Download", re.I)).first,
-            lambda: row.get_by_role("button", name=re.compile(r"PDF|Download", re.I)).first,
-            lambda: row.get_by_text(re.compile(r"PDF|Download", re.I)).first,
-            lambda: row.locator("a, button").filter(has_text=re.compile(r"PDF|Download", re.I)).first,
-            lambda: row.locator(".download").first,
-            lambda: row.locator("fa-icon.download").first,
-            lambda: row.locator("[data-icon='download']").first,
-            lambda: row.locator("svg[data-icon='download']").first,
-        ]
-        last_error = None
-        for factory in click_targets:
-            try:
-                target = factory()
-                target.wait_for(state="attached", timeout=3000)
-                try:
-                    target.click(timeout=5000)
-                except Exception:
-                    target.click(timeout=5000, force=True)
-                return
-            except Exception as exc:
-                last_error = exc
-        raise RuntimeError(f"无法点击 PDF/Download 动作: {last_error}")
-
-    def ensure_target_publication_view(self):
-        """优先进入目标 publication 页面，并识别 iframe 内稳定控件。"""
-        if self.page.url != self.publication_entrypoint_url():
-            self.page.goto(self.publication_entrypoint_url())
-            self.page.wait_for_load_state("load")
-        self.page.wait_for_timeout(1200)
-        for surface in self.get_document_surfaces():
-            try:
-                surface.locator("#pdf-button").first.wait_for(state="attached", timeout=3000)
-                return "direct_publication_iframe" if surface is not self.page else "direct_publication_page"
-            except Exception:
-                try:
-                    surface.locator("#publication-library").first.wait_for(
-                        state="attached", timeout=3000
-                    )
-                    return "direct_publication_iframe" if surface is not self.page else "direct_publication_page"
-                except Exception:
-                    continue
-        return None
-
-    def open_publications_menu(self):
-        """使用多套定位策略打开 Publications 菜单。"""
-        direct_mode = self.ensure_target_publication_view()
-        if direct_mode:
-            print(f"已进入目标 Publications 页面: {direct_mode}")
-            return direct_mode
-
-        last_error = None
-        for surface in self.get_document_surfaces():
-            strategies = [
-                ("role_button", lambda surface=surface: surface.get_by_role("button", name=re.compile(r"Publications", re.I)).first),
-                ("role_link", lambda surface=surface: surface.get_by_role("link", name=re.compile(r"Publications", re.I)).first),
-                ("nav_text", lambda surface=surface: surface.locator("nav, header, [role='navigation']").get_by_text("Publications").first),
-                ("page_text", lambda surface=surface: surface.get_by_text("Publications", exact=True).first),
-            ]
-
-            for strategy_name, locator_factory in strategies:
-                try:
-                    locator = locator_factory()
-                    locator.wait_for(state="visible", timeout=5000)
-                    locator.click(timeout=5000)
-                    self.page.wait_for_timeout(1000)
-                    print(f"已通过策略打开 Publications: {strategy_name} @ {self._surface_url(surface) or 'surface'}")
-                    return strategy_name
-                except Exception as exc:
-                    last_error = exc
-
-        raise ArgusStageError("publications_download", f"无法定位 Publications 菜单: {last_error}")
-
-    def collect_publication_candidates(self, target_date):
-        """按语义枚举与目标刊物相关的候选节点，兼容新版页面结构变化。"""
-        candidates = []
-        seen_texts = set()
-        for surface in self.get_document_surfaces():
-            for candidate in self._collect_surface_candidates(surface, target_date):
-                if candidate["text"] in seen_texts:
-                    continue
-                seen_texts.add(candidate["text"])
-                candidates.append(candidate)
-        return candidates
-
-    def locate_publication_download_row(self):
-        return (
-            self.page.locator("div, li, tr")
-            .filter(has_text="Argus Asia Bitumen Daily")
-            .filter(has_text="PDF")
-            .last
-        )
-
-    def locate_article_link(self):
-        patterns = [
-            re.compile(r"Asia bitumen daily", re.I),
-            re.compile(r"Argus Asia Bitumen Daily", re.I),
-        ]
-        for surface in self.get_document_surfaces():
-            for pattern in patterns:
-                for locator in (
-                    surface.get_by_role("link", name=pattern),
-                    surface.get_by_text(pattern),
-                ):
-                    try:
-                        locator.first.wait_for(state="visible", timeout=3000)
-                        return locator.first
-                    except Exception:
-                        continue
-        return None
-
-    def find_today_report_download(self, target_date):
-        candidates = self.collect_publication_candidates(target_date)
-        selected = select_publication_candidate(candidates, target_date)
-        if not selected:
-            return None
-        with self.page.expect_download() as download_info:
-            self._click_candidate_for_pdf(selected)
-        return download_info.value
-
     def is_expected_report_file(self, file_path, target_date):
         path = Path(file_path)
         if not path.exists() or path.suffix.lower() != ".pdf":
@@ -1711,42 +1634,6 @@ class ArgusDownloader:
 
         candidate_date = extract_report_date_compact(path.name)
         return is_report_date_within_lag(candidate_date, target_date)
-
-    def build_requests_session_from_browser(self):
-        requests = import_requests()
-        session = requests.Session()
-
-        try:
-            cookies = self.context.cookies()
-        except Exception as exc:
-            raise ArgusStageError("article_fallback", f"读取浏览器会话 Cookie 失败: {exc}") from exc
-
-        for cookie in cookies:
-            try:
-                session.cookies.set(
-                    cookie["name"],
-                    cookie["value"],
-                    domain=cookie.get("domain"),
-                    path=cookie.get("path", "/"),
-                )
-            except Exception:
-                continue
-
-        try:
-            user_agent = self.page.evaluate("() => navigator.userAgent")
-        except Exception:
-            user_agent = (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-            )
-
-        session.headers.update(
-            {
-                "User-Agent": user_agent,
-                "Accept": "text/html,application/pdf,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            }
-        )
-        return session
 
     def _build_pdf_fetch_result(self, pdf_bytes, file_name, target_date, stage, fallback_reason=None):
         file_name = file_name or f"Argus Asia Bitumen Daily ({target_date}).pdf"
@@ -1790,8 +1677,29 @@ class ArgusDownloader:
             fallback_reason=fallback_reason,
         )
 
+    def _build_pdf_fetch_result_from_http_response(self, response, target_date, stage, fallback_reason=None):
+        headers = getattr(response, "headers", {}) or {}
+        content_type = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+        body = response.content or b""
+        if "application/pdf" not in content_type and not body.startswith(b"%PDF-"):
+            return None
+
+        file_name = extract_filename_from_content_disposition(
+            headers.get("content-disposition") or headers.get("Content-Disposition")
+        )
+        if not file_name:
+            file_name = Path(urlparse(str(response.url)).path).name or f"Argus Asia Bitumen Daily ({target_date}).pdf"
+
+        return self._build_pdf_fetch_result(
+            body,
+            file_name=file_name,
+            target_date=target_date,
+            stage=stage,
+            fallback_reason=fallback_reason,
+        )
+
     def _fetch_pdf_from_candidate_urls(self, candidate_urls, target_date, stage, fallback_reason=None):
-        session = self.build_requests_session_from_browser()
+        session = self._build_requests_session_from_agent_browser()
         attempted = set()
 
         for url in candidate_urls:
@@ -1821,196 +1729,260 @@ class ArgusDownloader:
 
         return None
 
-    def _collect_surface_followup_urls(self):
-        urls = []
-        seen = set()
+    def _agent_browser_publication_state(self):
+        script = """
+(() => {
+  const frame = document.querySelector('#directWorkspacesIframe');
+  const frameDoc = frame?.contentDocument ?? null;
+  const heading = frameDoc?.querySelector('#publication-preview h2, h2')?.textContent?.trim() ?? '';
+  const dateValue = frameDoc?.querySelector('#date-picker, #alt-date, input.date-input')?.value ?? '';
+  return {
+    href: window.location.href,
+    hasEmail: !!document.querySelector('input[type="email"]'),
+    hasPassword: !!document.querySelector('input[type="password"]'),
+    hasPdfButton: !!frameDoc?.querySelector('#pdf-button'),
+    heading,
+    dateValue,
+  };
+})();
+"""
+        return self.agent_browser_eval(script, timeout=30) or {}
 
-        def push(url):
-            if not url or url in seen:
-                return
-            seen.add(url)
-            urls.append(url)
-
-        context_pages = list(getattr(self.context, "pages", []) or [])
-        if self.page and self.page not in context_pages:
-            context_pages.append(self.page)
-
-        for page in context_pages:
-            for surface in iter_document_surfaces(page):
-                surface_url = self._surface_url(surface)
-                if surface_url:
-                    push(surface_url)
-                try:
-                    html_text = surface.content()
-                except Exception:
-                    html_text = ""
-                for discovered in discover_followup_urls(surface_url or self.page.url, html_text):
-                    push(discovered)
-
-        return urls
-
-    def _download_candidate_via_browser_download(self, selected, target_date):
-        with self.page.expect_download(timeout=15000) as download_info:
-            self._click_candidate_for_pdf(selected)
-        download = download_info.value
-        file_name = download.suggested_filename or f"Argus Asia Bitumen Daily ({target_date}).pdf"
-        download_path = prepare_output_path(self.get_target_dir() / file_name)
-        download.save_as(str(download_path))
-
-        if not self.is_expected_report_file(download_path, target_date):
-            raise ArgusStageError(
-                "publications_download",
-                f"下载的 PDF 不在允许日期窗口内: {download_path.name}",
-            )
-
-        return FetchResult(
-            source_type="argus_pdf",
-            source_name=file_name,
-            source_report_date=extract_report_date_from_filename(file_name),
-            pdf_path=download_path,
-            artifact_path=download_path,
+    def _agent_browser_click_button_by_text(self, pattern):
+        self.run_agent_browser(
+            ["find", "role", "button", "click", "--name", pattern],
+            timeout=30,
         )
 
-    def _download_candidate_via_page_pdf_capture(self, selected, target_date, fallback_reason):
-        print(f"进入备用 PDF 捕获流程，原因: {fallback_reason}")
-        candidate_urls = []
-        seen_urls = set()
-        direct_pdf_results = []
+    def _agent_browser_login_argus(self):
+        argus_email = get_required_env("ARGUS_EMAIL")
+        argus_password = get_required_env("ARGUS_PASSWORD")
 
-        def push(url):
-            if not url or url in seen_urls:
-                return
-            seen_urls.add(url)
-            candidate_urls.append(url)
+        print("正在使用 agent-browser 访问网站...")
+        self.run_agent_browser(["open", self.publication_entrypoint_url()], timeout=90)
+        self.agent_browser_wait(AGENT_BROWSER_WAIT_MS, timeout=15)
+        deadline = time.time() + 30
+        state = {}
+        while time.time() < deadline:
+            state = self._agent_browser_publication_state()
+            if state.get("hasEmail") or state.get("hasPdfButton"):
+                break
+            self.agent_browser_wait(1000, timeout=10)
 
-        def on_response(response):
+        if state.get("hasEmail"):
+            self.run_agent_browser(["fill", 'input[type="email"]', argus_email], timeout=30)
+            self._agent_browser_click_button_by_text("Next")
+            self.agent_browser_wait('input[type="password"]', timeout=30)
+            self.run_agent_browser(["fill", 'input[type="password"]', argus_password], timeout=30)
+            self._agent_browser_click_button_by_text("Sign in")
+
+        deadline = time.time() + 60
+        last_state = state
+        while time.time() < deadline:
+            state = self._agent_browser_publication_state()
+            last_state = state
+            href = state.get("href", "")
+            if self.publication_entrypoint_url() in href and state.get("hasPdfButton"):
+                return state
+
             try:
-                response_url = str(response.url)
-                headers = response.headers or {}
-                content_type = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
-                if "application/pdf" in content_type:
-                    pdf_result = self._build_pdf_fetch_result_from_response(
-                        response,
-                        target_date=target_date,
-                        stage="publications_download",
-                        fallback_reason=fallback_reason,
-                    )
-                    if pdf_result:
-                        direct_pdf_results.append(pdf_result)
-                        return
-                lowered = response_url.lower()
-                if "application/pdf" in content_type or any(
-                    token in lowered for token in (".pdf", "download", "publication", "integration")
-                ):
-                    push(response_url)
-            except Exception:
-                return
-
-        if self.context:
-            try:
-                self.context.on("response", on_response)
+                self._agent_browser_click_button_by_text("Yes")
             except Exception:
                 pass
+            self.agent_browser_wait(1000, timeout=10)
 
-        try:
-            self._click_candidate_for_pdf(selected)
-        finally:
+        if last_state.get("hasEmail"):
+            raise ArgusStageError("login", "agent-browser 登录后仍停留在邮箱输入页")
+        if last_state.get("hasPassword"):
+            raise ArgusStageError("login", "agent-browser 登录后仍停留在密码输入页")
+        raise ArgusStageError("login", "agent-browser 登录超时，未进入 publication 页面")
+
+    def _agent_browser_install_publication_capture(self):
+        script = f"""
+(() => {{
+  const targetUrl = {json.dumps('/workspaces/api/publication')};
+  const frame = document.querySelector('#directWorkspacesIframe');
+  const windows = [window];
+  if (frame?.contentWindow && frame.contentWindow !== window) {{
+    windows.push(frame.contentWindow);
+  }}
+
+  for (const win of windows) {{
+    if (win.__argusCaptureInstalled) {{
+      continue;
+    }}
+    win.__argusCaptureInstalled = true;
+    win.__argusCapture = null;
+
+    const xhrProto = win.XMLHttpRequest?.prototype;
+    if (xhrProto && !xhrProto.__argusWrapped) {{
+      const originalOpen = xhrProto.open;
+      const originalSend = xhrProto.send;
+      const originalSetRequestHeader = xhrProto.setRequestHeader;
+      xhrProto.open = function(method, url, ...rest) {{
+        this.__argusRequest = {{ method, url, headers: {{}} }};
+        return originalOpen.call(this, method, url, ...rest);
+      }};
+      xhrProto.setRequestHeader = function(name, value) {{
+        if (this.__argusRequest) {{
+          this.__argusRequest.headers[name] = value;
+        }}
+        return originalSetRequestHeader.call(this, name, value);
+      }};
+      xhrProto.send = function(body) {{
+        if (this.__argusRequest && String(this.__argusRequest.url).includes(targetUrl)) {{
+          const requestMeta = this.__argusRequest;
+          this.addEventListener('load', () => {{
+            win.__argusCapture = {{
+              method: requestMeta.method,
+              url: requestMeta.url,
+              headers: requestMeta.headers,
+              body: typeof body === 'string' ? body : null,
+              status: this.status,
+            }};
+          }});
+        }}
+        return originalSend.call(this, body);
+      }};
+      xhrProto.__argusWrapped = true;
+    }}
+
+    if (win.fetch && !win.__argusFetchWrapped) {{
+      const originalFetch = win.fetch.bind(win);
+      win.fetch = async (...args) => {{
+        const [resource, init] = args;
+        const url = typeof resource === 'string' ? resource : resource?.url;
+        const response = await originalFetch(...args);
+        if (String(url || '').includes(targetUrl)) {{
+          win.__argusCapture = {{
+            method: init?.method || 'GET',
+            url,
+            headers: init?.headers || {{}},
+            body: typeof init?.body === 'string' ? init.body : null,
+            status: response.status,
+          }};
+        }}
+        return response;
+      }};
+      win.__argusFetchWrapped = true;
+    }}
+  }}
+  return true;
+}})();
+"""
+        self.agent_browser_eval(script, timeout=30)
+
+    def _agent_browser_trigger_publication_download(self):
+        script = """
+(() => {
+  const frame = document.querySelector('#directWorkspacesIframe');
+  const button = frame?.contentDocument?.querySelector('#pdf-button');
+  if (!button) {
+    throw new Error('pdf button not found');
+  }
+  button.click();
+  return true;
+})();
+"""
+        self.agent_browser_eval(script, timeout=30)
+
+    def _agent_browser_poll_publication_capture(self):
+        script = """
+(() => {
+  const frame = document.querySelector('#directWorkspacesIframe');
+  return window.__argusCapture ?? frame?.contentWindow?.__argusCapture ?? null;
+})();
+"""
+        deadline = time.time() + AGENT_BROWSER_CAPTURE_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            capture = self.agent_browser_eval(script, timeout=15)
+            if capture:
+                return capture
+            self.agent_browser_wait(1000, timeout=10)
+        raise ArgusStageError("publications_download", "agent-browser 未捕获到 publication API 请求")
+
+    def _build_requests_session_from_agent_browser(self):
+        requests = import_requests()
+        session = requests.Session()
+        cookies_payload = self.run_agent_browser(["cookies", "get"], json_output=True, timeout=30) or {}
+        cookies = cookies_payload.get("cookies", []) if isinstance(cookies_payload, dict) else cookies_payload
+        for cookie in cookies or []:
             try:
-                self.page.wait_for_timeout(2500)
+                session.cookies.set(
+                    cookie["name"],
+                    cookie["value"],
+                    domain=cookie.get("domain"),
+                    path=cookie.get("path", "/"),
+                )
             except Exception:
-                pass
-            if self.context:
-                try:
-                    self.context.remove_listener("response", on_response)
-                except Exception:
-                    pass
-
-        if direct_pdf_results:
-            return direct_pdf_results[0]
-
-        for url in self._collect_surface_followup_urls():
-            push(url)
-
-        fetch_result = self._fetch_pdf_from_candidate_urls(
-            candidate_urls,
-            target_date=target_date,
-            stage="publications_download",
-            fallback_reason=fallback_reason,
+                continue
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/pdf,application/json,text/plain,*/*",
+                "Origin": "https://direct.argusmedia.com",
+                "Referer": self.publication_entrypoint_url(),
+            }
         )
-        if fetch_result:
-            return fetch_result
+        return session
 
-        raise ArgusStageError("publications_download", "备用 PDF 捕获失败: 未拿到可用 PDF")
-
-    def _get_target_publication_surface(self):
-        for surface in self.get_document_surfaces():
-            if self._surface_url(surface) == self.integration_publication_url():
-                return surface
-        for surface in self.get_document_surfaces():
-            if self._surface_matches_target_publication(surface):
-                return surface
-        return None
-
-    def _download_publication_pdf_direct(self, target_date):
-        print("正在打开目标 publication 页面...")
-        direct_mode = self.ensure_target_publication_view()
-        if not direct_mode:
-            raise ArgusStageError("publications_download", "未能进入目标 publication 页面")
-
-        surface = self._get_target_publication_surface()
-        if surface is None:
-            raise ArgusStageError("publications_download", "未找到目标 publication surface")
-
-        metadata = self._get_direct_publication_metadata(surface)
-        if not metadata:
-            raise ArgusStageError("publications_download", "目标 publication 页面未解析到下载按钮")
-
-        print(f"已进入目标 Publications 页面: {direct_mode}")
+    def _download_publication_pdf_via_agent_browser(self, target_date):
+        state = self._agent_browser_login_argus()
+        self._agent_browser_install_publication_capture()
+        print("已进入目标 Publications 页面: agent-browser")
         direct_label = "\n".join(
-            part
-            for part in (metadata["heading"], "Download PDF", metadata["date_text"])
-            if part
+            part for part in ("Argus Asia Bitumen Daily", "Download PDF", state.get("dateValue")) if part
         )
         print(f"准备下载候选项: {direct_label}")
-        try:
-            with self.page.expect_response(
-                lambda response: "/workspaces/api/publication" in response.url
-                and response.request.method == "POST",
-                timeout=20000,
-            ) as response_info:
-                surface.locator("#pdf-button").first.click(timeout=5000)
-            response = response_info.value
-            result = self._build_pdf_fetch_result_from_response(
-                response,
-                target_date=target_date,
-                stage="publications_download",
-                fallback_reason="direct_publication_api",
-            )
-            if result:
-                print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
-                return result
-        except Exception as exc:
-            self.add_warning("publications_download", f"精确路径 API 下载失败: {exc}")
+        self._agent_browser_trigger_publication_download()
+        capture = self._agent_browser_poll_publication_capture()
 
-        try:
-            result = self._download_candidate_via_page_pdf_capture(
-                {
-                    "row": surface.locator("#publication-preview").first,
-                    "text": direct_label,
-                    "surface": surface,
-                    "surface_url": self._surface_url(surface),
-                },
-                target_date,
-                fallback_reason="direct_publication_api_fallback",
-            )
-            print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
-            return result
-        except Exception as exc:
-            raise ArgusStageError("publications_download", f"精确路径下载失败: {exc}") from exc
+        session = self._build_requests_session_from_agent_browser()
+        headers = capture.get("headers") or {}
+        if isinstance(headers, list):
+            headers = {item.get("name"): item.get("value") for item in headers if isinstance(item, dict)}
+        request_headers = {
+            key: value
+            for key, value in headers.items()
+            if key and key.lower() not in {"content-length", "cookie", "host"}
+        }
+        session.headers.update(request_headers)
+
+        request_url = capture.get("url") or "https://direct.argusmedia.com/workspaces/api/publication"
+        if request_url.startswith("/"):
+            request_url = urljoin(self.publication_entrypoint_url(), request_url)
+        request_body = capture.get("body") or json.dumps(
+            {
+                "publicationId": int(self.publication_id),
+                "publicationDate": datetime.strptime(target_date, "%Y%m%d").strftime("%Y-%m-%dT00:00:00.0000000Z"),
+                "language": "en-GB",
+            }
+        )
+
+        response = session.request(
+            method=(capture.get("method") or "POST").upper(),
+            url=request_url,
+            data=request_body,
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = self._build_pdf_fetch_result_from_http_response(
+            response,
+            target_date=target_date,
+            stage="publications_download",
+            fallback_reason="agent_browser_publication_api",
+        )
+        if not result:
+            raise ArgusStageError("publications_download", "agent-browser 请求未返回有效 PDF")
+        print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
+        return result
 
     def fetch_publication_pdf_via_http_fallback(self, target_date, fallback_reason):
         print(f"进入认证 HTTP 回退流程，原因: {fallback_reason}")
-        session = self.build_requests_session_from_browser()
+        session = self._build_requests_session_from_agent_browser()
 
         seed_urls = [
             f"https://direct.argusmedia.com/publication?publicationId={self.publication_id}",
@@ -2079,63 +2051,34 @@ class ArgusDownloader:
 
     def download_publication_pdf(self, target_date):
         try:
-            return self._download_publication_pdf_direct(target_date)
+            return self._download_publication_pdf_via_agent_browser(target_date)
         except Exception as exc:
-            self.add_warning("publications_download", f"精确下载路径失败，回退到候选扫描: {exc}")
-
-        print("正在打开 Publications 菜单...")
-        self.open_publications_menu()
-        self.page.wait_for_timeout(1500)
-        candidates = self.collect_publication_candidates(target_date)
-        selected = select_publication_candidate(candidates, target_date)
-        if not selected:
-            raise ArgusStageError("publications_download", "未找到匹配的 Argus Asia Bitumen Daily 候选项")
-        print(f"准备下载候选项: {selected['text']}")
-        try:
-            result = self._download_candidate_via_browser_download(selected, target_date)
-        except Exception as exc:
-            result = self._download_candidate_via_page_pdf_capture(
-                selected,
+            self.add_warning("publications_download", f"agent-browser 精确路径失败，回退到 HTTP: {exc}")
+            return self.fetch_publication_pdf_via_http_fallback(
                 target_date,
-                fallback_reason=f"浏览器下载事件失败: {exc}",
+                fallback_reason=f"agent-browser direct path failed: {exc}",
             )
-
-        print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
-        return result
 
     def fetch_article_fallback(self, target_date, fallback_reason):
         """下载失败时，尝试打开 Argus Direct 文章页并提取正文文本。"""
         print(f"进入 Argus Direct 文章回退流程，原因: {fallback_reason}")
-        try:
-            self.open_publications_menu()
-        except Exception:
-            pass
-        article_link = self.locate_article_link()
-        if article_link is None:
-            raise ArgusStageError("article_fallback", "文章回退失败: 未找到 Asia bitumen daily 文章链接")
-
-        active_page = self.page
-        try:
-            with self.context.expect_page(timeout=5000) as new_page_info:
-                article_link.click(timeout=5000)
-            active_page = new_page_info.value
-            active_page.wait_for_load_state("load")
-        except Exception:
-            article_link.click(timeout=5000)
-            try:
-                self.page.wait_for_load_state("load")
-            except Exception:
-                pass
-            active_page = self.page
-
-        article_text = ""
-        for selector in ("article", "main", "[role='main']", "body"):
-            try:
-                article_text = active_page.locator(selector).first.inner_text(timeout=5000).strip()
-            except Exception:
-                article_text = ""
-            if len(article_text) >= 500:
-                break
+        self._agent_browser_login_argus()
+        article_text = self.agent_browser_eval(
+            """
+(() => {
+  const frame = document.querySelector('#directWorkspacesIframe');
+  const frameDoc = frame?.contentDocument ?? null;
+  if (!frameDoc) return '';
+  const selectors = ['article', 'main', '[role="main"]', 'body'];
+  for (const selector of selectors) {
+    const text = frameDoc.querySelector(selector)?.innerText?.trim() ?? '';
+    if (text.length >= 500) return text;
+  }
+  return frameDoc.body?.innerText?.trim() ?? '';
+})();
+""",
+            timeout=30,
+        ) or ""
 
         if len(article_text) < 200:
             raise ArgusStageError("article_fallback", "文章回退失败: 页面正文提取长度不足")
@@ -2148,9 +2091,6 @@ class ArgusDownloader:
         artifact_path.write_text(article_text, encoding="utf-8")
         print(f"已保存文章回退文本: {artifact_path}")
 
-        if active_page != self.page:
-            active_page.close()
-
         return FetchResult(
             source_type="argus_direct_article_fallback",
             source_name="Argus Direct Article",
@@ -2159,55 +2099,6 @@ class ArgusDownloader:
             text_content=article_text,
             fallback_reason=fallback_reason,
         )
-
-    def start_browser(self):
-        """启动浏览器并进行基础设置"""
-        sync_playwright = import_playwright_sync()
-        self.p = sync_playwright().start()
-        # 添加 args=['--start-maximized'] 配合 no_viewport=True 使浏览器窗口最大化（全屏）
-        self.browser = self.p.chromium.launch(headless=True, args=["--start-maximized"])
-        # 在 headless=True 模式下，--start-maximized 通常不起作用，因为没有实际的屏幕。
-        # 所以必须强制指定一个较大的 viewport (分辨率)，让网页以桌面端布局渲染，而不是移动端/折叠态。
-        self.context = self.browser.new_context(
-            viewport={"width": 1920, "height": 1080}
-        )
-        self.page = self.context.new_page()
-
-    def login(self):
-        """执行登录操作"""
-        argus_email = get_required_env("ARGUS_EMAIL")
-        argus_password = get_required_env("ARGUS_PASSWORD")
-
-        print("正在访问网站...")
-        self.page.goto(self.publication_entrypoint_url())
-
-        # 1. 登录流程 - 输入邮箱
-        self.page.wait_for_selector('input[type="email"]')
-        self.page.fill('input[type="email"]', argus_email)
-        self.page.get_by_role("button", name="Next").click()
-
-        # 2. 登录流程 - 输入密码
-        self.page.wait_for_selector('input[type="password"]')
-        self.page.fill('input[type="password"]', argus_password)
-        self.page.get_by_role("button", name="Sign in").click()
-
-        print("登录成功，正在跳转页面...")
-
-        # 尝试处理可能出现的 "Stay signed in?" (是否保持登录状态) 提示页面
-        try:
-            # 微软登录经常会问 "Stay signed in?"
-            btn = self.page.locator(
-                'input[type="submit"][value="Yes"], input[type="button"][value="Yes"], button:has-text("Yes"), input[value="是"], button:has-text("是")'
-            ).first
-            btn.wait_for(state="visible", timeout=5000)
-            print("发现 '保持登录状态' 提示，正在点击确认...")
-            btn.click()
-        except Exception:
-            pass
-
-        # 避免使用 networkidle，因为它在有长连接或后台轮询的网站上极易超时
-        # 改为等待页面加载完成即可，后续的操作会由 Playwright 的自动等待机制(auto-wait)处理
-        self.page.wait_for_load_state("load")
 
     def get_asia_bitumen_daily(self):
         """获取亚洲沥青日报 (Argus Asia Bitumen Daily)"""
@@ -2275,7 +2166,7 @@ class ArgusDownloader:
             raise ArgusStageError("report_generation", str(exc)) from exc
 
         if not final_pdf_path or not Path(final_pdf_path).exists():
-            raise ArgusStageError("report_generation", "最终 PDF 未生成成功")
+            raise ArgusStageError("report_generation", "最终图片未生成成功")
 
         return final_pdf_path
 
@@ -2447,7 +2338,7 @@ JSON schema:
             )
             new_html_content = render_report_template(html_template, report_payload)
 
-            # 为 PDF 打印阶段显式注入中文字体，避免 Linux 服务器缺少系统字体导致乱码
+            # 为图片渲染阶段显式注入中文字体，避免运行环境缺少系统字体导致乱码
             embedded_fonts = resolve_chinese_font_paths()
             font_css = build_embedded_font_css(embedded_fonts)
             new_html_content = inject_pdf_font_styles(
@@ -2471,59 +2362,31 @@ JSON schema:
                 f.write(new_html_content.strip())
             print(f"-> 中文版 HTML 生成成功，已保存至: {new_html_path}")
 
-            print("4. 正在使用 Playwright 将 HTML 转换为 PDF...")
-            new_pdf_path = prepare_output_path(
-                self.get_target_dir() / f"{base_name}_zh.pdf"
+            print("4. 正在使用 agent-browser 将 HTML 转换为 PNG...")
+            new_image_path = prepare_output_path(
+                self.get_target_dir() / f"{base_name}_zh.png"
             )
 
-            # 使用临时的无头浏览器上下文进行 PDF 打印 (因为有头模式不支持 page.pdf)
-            temp_browser = self.p.chromium.launch(headless=True)
-            temp_page = temp_browser.new_page()
-
-            temp_page.goto(Path(new_html_path).resolve().as_uri())
-            temp_page.wait_for_load_state("domcontentloaded")
-            # 等待页面字体真正完成加载，避免打印时仍在字体回退阶段
-            temp_page.wait_for_function(
-                "() => document.fonts && document.fonts.status === 'loaded'"
+            image_session = f"argus-html-image-{uuid.uuid4().hex[:8]}"
+            image_metrics = render_html_image_via_agent_browser(
+                self.run_agent_browser,
+                html_path=new_html_path,
+                output_image_path=new_image_path,
+                session_name=image_session,
             )
+            image_width = image_metrics["imageSize"]["width"]
+            image_height = image_metrics["imageSize"]["height"]
+            print(f"-> 图片渲染尺寸: width={image_width}, height={image_height}")
 
-            pdf_metrics = temp_page.evaluate(
-                """
-                () => {
-                    const container = document.getElementById('report-container') || document.body;
-                    const rect = container.getBoundingClientRect();
-                    return {
-                        width: Math.ceil(rect.width),
-                        height: Math.ceil(container.scrollHeight),
-                    };
-                }
-                """
-            )
-            pdf_width, pdf_height = compute_single_page_pdf_size(
-                pdf_metrics["width"], pdf_metrics["height"]
-            )
-            print(f"-> 单页 PDF 尺寸: width={pdf_width}, height={pdf_height}")
+            print(f"-> 中文版 PNG 生成成功，已保存至: {new_image_path}")
 
-            # 导出为超长单页 PDF，避免 A4 分页截断
-            temp_page.pdf(
-                path=str(new_pdf_path),
-                width=pdf_width,
-                height=pdf_height,
-                print_background=True,
-                prefer_css_page_size=False,
-                margin={"top": "0px", "right": "0px", "bottom": "0px", "left": "0px"},
-            )
-            temp_browser.close()
-
-            print(f"-> 中文版 PDF 生成成功，已保存至: {new_pdf_path}")
-
-            # 推送生成的 PDF 给指定用户
-            delivered = send_pdf_to_dingtalk(str(new_pdf_path), self.target_user_ids)
+            # 推送生成的图片给指定用户
+            delivered = send_file_to_dingtalk(str(new_image_path), self.target_user_ids)
             if delivered is False:
-                self.add_warning("delivery", "钉钉发送未成功，但 PDF 已生成")
+                self.add_warning("delivery", "钉钉发送未成功，但图片已生成")
 
             print("=== 处理完成 ===\n")
-            return new_pdf_path
+            return new_image_path
 
         except Exception as e:
             raise ArgusStageError("report_generation", f"大模型调用或PDF生成过程中发生错误: {e}") from e
@@ -2576,85 +2439,67 @@ JSON schema:
         """获取隆众沥青价格信息"""
         print("\n=== 开始获取隆众沥青价格 ===")
         print("1. 正在访问隆众能源网...")
-        self.page.goto(
-            "https://oil.oilchem.net/oil/asphalt.shtml",
-            wait_until="domcontentloaded",
-            timeout=60000,
+        session_name = f"oilchem-asphalt-{uuid.uuid4().hex[:8]}"
+        self.run_agent_browser(
+            ["open", "https://oil.oilchem.net/oil/asphalt.shtml"],
+            timeout=90,
+            session=session_name,
         )
+        self.run_agent_browser(["wait", "3000"], timeout=15, session=session_name)
 
-        print("2. 等待并点击顶部'能源'页签...")
-        ny_link = self.page.locator("a", has_text="能源").filter(has_text="能源").first
-        ny_link.hover()
-        self.page.wait_for_timeout(1000)  # 等待下拉菜单动画
-
-        print("3. 寻找并点击下拉菜单中的'沥青'链接...")
-        links = self.page.locator("a", has_text="沥青").all()
-        target_link = None
-        for link in links:
-            if link.inner_text().strip() == "沥青":
-                target_link = link
-                break
-
-        if target_link:
-            # 尝试点击并捕获可能的新页面
-            try:
-                with self.context.expect_page(timeout=3000) as new_page_info:
-                    target_link.click()
-                active_page = new_page_info.value
-                active_page.wait_for_load_state("load", timeout=60000)
-                print("-> 已打开新页面")
-            except Exception:
-                # 没有触发新页面（例如 target 并非 _blank），则在当前页面继续
-                active_page = self.page
-                active_page.wait_for_load_state("load", timeout=60000)
-                print("-> 在当前页面加载完成")
-
-            active_page.wait_for_timeout(2000)  # 等待 DOM 渲染
-
-            print("4. 正在提取华东和华南价格及其变动...")
-            result = {}
-            try:
-                market_price_section = (
-                    active_page.locator("div, section")
-                    .filter(has_text=re.compile(r"沥青市场价格|Market Price", re.I))
-                    .first
-                )
-                market_price_section.wait_for(state="visible", timeout=5000)
-                market_price_text = market_price_section.inner_text(timeout=5000)
-
-                # 华东数据
-                huadong_price, huadong_change = extract_market_price_from_section(
-                    market_price_text, "华东"
-                )
-                result["huadong"] = {"price": huadong_price, "change": huadong_change}
-
-                # 华南数据
-                huanan_price, huanan_change = extract_market_price_from_section(
-                    market_price_text, "华南"
-                )
-                result["huanan"] = {"price": huanan_price, "change": huanan_change}
-
-                print(
-                    f"-> 提取成功！\n【华东沥青】价格: {huadong_price}, 变动: {huadong_change}\n【华南沥青】价格: {huanan_price}, 变动: {huanan_change}"
-                )
-
-            except Exception as e:
-                print(f"提取价格数据失败: {e}")
-
-            # 如果是新打开的页面，使用完毕后可以选择关闭
-            if active_page != self.page:
-                active_page.close()
-
-            print("=== 获取隆众沥青价格完成 ===\n")
-            return result
-
+        print("2. 解析'沥青'目标链接...")
+        asphalt_href = self.run_agent_browser(
+            ["eval", "--stdin"],
+            json_output=True,
+            timeout=20,
+            stdin_text=build_exact_link_href_script("沥青"),
+            session=session_name,
+        )
+        if asphalt_href:
+            print("3. 直接打开'沥青'页面...")
+            self.run_agent_browser(["open", asphalt_href], timeout=90, session=session_name)
+            self.run_agent_browser(["wait", "5000"], timeout=15, session=session_name)
         else:
-            print("未找到精确匹配的'沥青'链接。")
-            print("=== 获取隆众沥青价格完成 ===\n")
-            return None
+            print("3. 未找到精确'沥青'链接，继续使用当前页面。")
+
+        print("4. 正在提取华东和华南价格及其变动...")
+        result = {}
+        try:
+            market_price_text = self.run_agent_browser(
+                ["eval", "--stdin"],
+                json_output=True,
+                timeout=20,
+                stdin_text=build_market_price_section_script(),
+                session=session_name,
+            ) or ""
+            if not market_price_text:
+                raise RuntimeError("页面中未提取到沥青市场价格板块")
+
+            huadong_price, huadong_change = extract_market_price_from_section(
+                market_price_text, "华东"
+            )
+            result["huadong"] = {"price": huadong_price, "change": huadong_change}
+
+            huanan_price, huanan_change = extract_market_price_from_section(
+                market_price_text, "华南"
+            )
+            result["huanan"] = {"price": huanan_price, "change": huanan_change}
+
+            print(
+                f"-> 提取成功！\n【华东沥青】价格: {huadong_price}, 变动: {huadong_change}\n【华南沥青】价格: {huanan_price}, 变动: {huanan_change}"
+            )
+        except Exception as e:
+            print(f"提取价格数据失败: {e}")
+
+        print("=== 获取隆众沥青价格完成 ===\n")
+        return result or None
 
     def close(self):
         """关闭浏览器和上下文"""
+        try:
+            self.run_agent_browser(["close"], timeout=15)
+        except Exception:
+            pass
         if self.context:
             self.context.close()
         if self.browser:
@@ -2713,14 +2558,6 @@ def main():
     )
 
     try:
-        # 1. 启动浏览器并登录
-        downloader.start_browser()
-        try:
-            downloader.login()
-        except Exception as exc:
-            raise ArgusStageError("login", str(exc)) from exc
-
-        # 2. 根据命令行参数动态调用对应的方法
         method_name = args.method
         if hasattr(downloader, method_name) and callable(
             getattr(downloader, method_name)
@@ -2734,7 +2571,8 @@ def main():
                     {
                         "status": "success",
                         "method": method_name,
-                        "final_pdf_path": str(final_pdf_path) if final_pdf_path else None,
+                        "final_artifact_path": str(final_pdf_path) if final_pdf_path else None,
+                        "final_pdf_path": str(final_pdf_path) if final_pdf_path and str(final_pdf_path).lower().endswith(".pdf") else None,
                         "warnings": downloader.warnings,
                     },
                     ensure_ascii=False,

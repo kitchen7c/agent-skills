@@ -15,7 +15,9 @@ fi
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 mkdir -p "${UV_CACHE_DIR}"
 
-exec uv run \
-  --python 3.11 \
-  --with-requirements "${REQUIREMENTS_FILE}" \
-  python -m playwright install chromium
+if ! command -v agent-browser >/dev/null 2>&1; then
+  echo "agent-browser 未安装，请先安装 agent-browser CLI" >&2
+  exit 1
+fi
+
+exec agent-browser install

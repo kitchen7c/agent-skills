@@ -670,7 +670,8 @@ def build_source_metadata(
     }.get(source_type, source_type)
 
     note_parts = [f"来源: {mode_label}", f"引用日期: {source_report_date or '-'}"]
-    if fallback_reason:
+    show_fallback_reason = source_type != "argus_pdf"
+    if fallback_reason and show_fallback_reason:
         note_parts.append(f"回退原因: {fallback_reason}")
 
     return {
@@ -882,6 +883,16 @@ def build_market_price_section_script():
   return match ? match.innerText : '';
 })();
 """
+
+
+def build_publication_api_payload(publication_id, target_date):
+    return {
+        "publicationId": int(publication_id),
+        "publicationDate": datetime.strptime(target_date, "%Y%m%d").strftime(
+            "%Y-%m-%dT00:00:00.0000000Z"
+        ),
+        "language": "en-GB",
+    }
 
 
 def compute_single_page_pdf_size(content_width_px, content_height_px, padding_px=80):
@@ -1781,13 +1792,19 @@ class ArgusDownloader:
 (() => {
   const frame = document.querySelector('#directWorkspacesIframe');
   const frameDoc = frame?.contentDocument ?? null;
+  const frameText = frameDoc?.body?.innerText?.trim() ?? '';
+  const frameHtml = frameDoc?.documentElement?.innerHTML ?? '';
   const heading = frameDoc?.querySelector('#publication-preview h2, h2')?.textContent?.trim() ?? '';
   const dateValue = frameDoc?.querySelector('#date-picker, #alt-date, input.date-input')?.value ?? '';
   return {
     href: window.location.href,
+    hasIframe: !!frame,
+    iframeSrc: frame?.src ?? '',
     hasEmail: !!document.querySelector('input[type="email"]'),
     hasPassword: !!document.querySelector('input[type="password"]'),
     hasPdfButton: !!frameDoc?.querySelector('#pdf-button'),
+    iframeBlank: !!frame && !!frameDoc && frameText.length === 0,
+    iframeError: frameHtml.includes('requireConfig') ? 'Script error for: requireConfig' : '',
     heading,
     dateValue,
   };
@@ -1801,6 +1818,35 @@ class ArgusDownloader:
             timeout=30,
         )
 
+    def _agent_browser_get_current_url(self):
+        try:
+            return self.run_agent_browser(["get", "url"], timeout=30)
+        except Exception:
+            return ""
+
+    def _agent_browser_is_login_url(self, url):
+        lowered = (url or "").lower()
+        return "myaccount.argusmedia.com" in lowered or "/login" in lowered
+
+    def _agent_browser_session_is_authenticated(self):
+        try:
+            session = self._build_requests_session_from_agent_browser()
+        except Exception:
+            return False
+        try:
+            response = session.get(
+                self.publication_entrypoint_url(),
+                timeout=15,
+                allow_redirects=True,
+            )
+        except Exception:
+            return False
+
+        final_url = str(getattr(response, "url", "") or "")
+        if self._agent_browser_is_login_url(final_url):
+            return False
+        return self.publication_entrypoint_url() in final_url
+
     def _agent_browser_login_argus(self):
         argus_email = get_required_env("ARGUS_EMAIL")
         argus_password = get_required_env("ARGUS_PASSWORD")
@@ -1810,13 +1856,25 @@ class ArgusDownloader:
         self.agent_browser_wait(AGENT_BROWSER_WAIT_MS, timeout=15)
         deadline = time.time() + 30
         state = {}
+        state_probe_failed = False
         while time.time() < deadline:
-            state = self._agent_browser_publication_state()
-            if state.get("hasEmail") or state.get("hasPdfButton"):
+            try:
+                state = self._agent_browser_publication_state()
+            except Exception:
+                state = {}
+                state_probe_failed = True
+            href = state.get("href") or self._agent_browser_get_current_url()
+            if (
+                state.get("hasEmail")
+                or self._agent_browser_is_login_url(href)
+                or self.publication_entrypoint_url() in href
+            ):
+                state["href"] = href
                 break
             self.agent_browser_wait(1000, timeout=10)
 
-        if state.get("hasEmail"):
+        if state.get("hasEmail") or self._agent_browser_is_login_url(state.get("href", "")):
+            self.agent_browser_wait('input[type="email"]', timeout=30)
             self.run_agent_browser(["fill", 'input[type="email"]', argus_email], timeout=30)
             self._agent_browser_click_button_by_text("Next")
             self.agent_browser_wait('input[type="password"]', timeout=30)
@@ -1826,10 +1884,23 @@ class ArgusDownloader:
         deadline = time.time() + 60
         last_state = state
         while time.time() < deadline:
-            state = self._agent_browser_publication_state()
+            try:
+                state = self._agent_browser_publication_state()
+            except Exception:
+                state = {}
+                state_probe_failed = True
             last_state = state
-            href = state.get("href", "")
-            if self.publication_entrypoint_url() in href and state.get("hasPdfButton"):
+            href = state.get("href") or self._agent_browser_get_current_url()
+            if (
+                self.publication_entrypoint_url() in href
+                and not state.get("hasEmail")
+                and not state.get("hasPassword")
+            ):
+                if state_probe_failed and not self._agent_browser_session_is_authenticated():
+                    raise ArgusStageError("login", "agent-browser 状态探测失败，且未建立可用登录态")
+                state["href"] = href
+                if state_probe_failed:
+                    state["stateProbeFailed"] = True
                 return state
 
             try:
@@ -1838,6 +1909,18 @@ class ArgusDownloader:
                 pass
             self.agent_browser_wait(1000, timeout=10)
 
+        last_href = last_state.get("href") or self._agent_browser_get_current_url()
+        if (
+            self.publication_entrypoint_url() in last_href
+            and not last_state.get("hasEmail")
+            and not last_state.get("hasPassword")
+        ):
+            if state_probe_failed and not self._agent_browser_session_is_authenticated():
+                raise ArgusStageError("login", "agent-browser 状态探测失败，且未建立可用登录态")
+            last_state["href"] = last_href
+            if state_probe_failed:
+                last_state["stateProbeFailed"] = True
+            return last_state
         if last_state.get("hasEmail"):
             raise ArgusStageError("login", "agent-browser 登录后仍停留在邮箱输入页")
         if last_state.get("hasPassword"):
@@ -1976,16 +2059,55 @@ class ArgusDownloader:
         )
         return session
 
+    def _fetch_publication_pdf_via_direct_api(self, target_date, fallback_reason):
+        session = self._build_requests_session_from_agent_browser()
+        request_url = "https://direct.argusmedia.com/workspaces/api/publication"
+        request_body = json.dumps(build_publication_api_payload(self.publication_id, target_date))
+        response = session.post(
+            request_url,
+            data=request_body,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = self._build_pdf_fetch_result_from_http_response(
+            response,
+            target_date=target_date,
+            stage="publications_download",
+            fallback_reason=fallback_reason,
+        )
+        if not result:
+            raise ArgusStageError("publications_download", "direct publication API 未返回有效 PDF")
+        print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
+        return result
+
     def _download_publication_pdf_via_agent_browser(self, target_date):
         state = self._agent_browser_login_argus()
-        self._agent_browser_install_publication_capture()
         print("已进入目标 Publications 页面: agent-browser")
         direct_label = "\n".join(
             part for part in ("Argus Asia Bitumen Daily", "Download PDF", state.get("dateValue")) if part
         )
         print(f"准备下载候选项: {direct_label}")
-        self._agent_browser_trigger_publication_download()
-        capture = self._agent_browser_poll_publication_capture()
+        try:
+            return self._fetch_publication_pdf_via_direct_api(
+                target_date,
+                fallback_reason="agent-browser authenticated session",
+            )
+        except Exception as exc:
+            self.add_warning(
+                "publications_download",
+                f"direct publication API 失败，回退到 legacy UI: {exc}",
+            )
+
+        self._agent_browser_install_publication_capture()
+        try:
+            self._agent_browser_trigger_publication_download()
+            capture = self._agent_browser_poll_publication_capture()
+        except Exception as exc:
+            fallback_reason = f"legacy publication UI unavailable: {exc}"
+            if state.get("iframeError"):
+                fallback_reason = f"{fallback_reason}; {state['iframeError']}"
+            return self._fetch_publication_pdf_via_direct_api(target_date, fallback_reason)
 
         session = self._build_requests_session_from_agent_browser()
         headers = capture.get("headers") or {}
@@ -2002,11 +2124,7 @@ class ArgusDownloader:
         if request_url.startswith("/"):
             request_url = urljoin(self.publication_entrypoint_url(), request_url)
         request_body = capture.get("body") or json.dumps(
-            {
-                "publicationId": int(self.publication_id),
-                "publicationDate": datetime.strptime(target_date, "%Y%m%d").strftime("%Y-%m-%dT00:00:00.0000000Z"),
-                "language": "en-GB",
-            }
+            build_publication_api_payload(self.publication_id, target_date)
         )
 
         response = session.request(
@@ -2100,7 +2218,17 @@ class ArgusDownloader:
         try:
             return self._download_publication_pdf_via_agent_browser(target_date)
         except Exception as exc:
-            self.add_warning("publications_download", f"agent-browser 精确路径失败，回退到 HTTP: {exc}")
+            self.add_warning("publications_download", f"agent-browser 精确路径失败，先回退到 direct API: {exc}")
+            try:
+                return self._fetch_publication_pdf_via_direct_api(
+                    target_date,
+                    fallback_reason=f"agent-browser direct path failed: {exc}",
+                )
+            except Exception as direct_api_exc:
+                self.add_warning(
+                    "publications_download",
+                    f"direct publication API 回退失败，继续回退到 HTTP: {direct_api_exc}",
+                )
             return self.fetch_publication_pdf_via_http_fallback(
                 target_date,
                 fallback_reason=f"agent-browser direct path failed: {exc}",
@@ -2192,6 +2320,12 @@ class ArgusDownloader:
                 f"显式沿用 {verified_date_cn} 最新已核验正文，不假设新一期内容不变"
             )
             fetch_result = self.load_explicit_verified_text_fallback(fallback_reason)
+
+        if fetch_result is None:
+            raise ArgusStageError(
+                "publications_download",
+                "未获取到可用的 Argus 源内容",
+            )
 
         # 获取隆众沥青价格
         try:

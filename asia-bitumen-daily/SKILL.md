@@ -93,6 +93,7 @@ uv run --python 3.11 scripts/hnxcl.py --method get_asia_bitumen_daily --user_id 
 - Python 依赖以 `scripts/requirements-hnxcl.txt` 为准，由启动脚本通过 `uv run --with-requirements` 解析
 - 如果执行环境没有可用的 `agent-browser` 浏览器运行时，先执行 `bash scripts/bootstrap_hnxcl_uv.sh`
 - `scripts/bootstrap_hnxcl_uv.sh` 负责安装 `agent-browser` 所需的 Chromium 运行时，随后再执行主流程
+- Argus 外层 publication 页面加载成功但 legacy iframe `/integration/publication` 空白或出现 `requireConfig` 脚本错误时，不要继续依赖 iframe 内 DOM、PDF 按钮或文章正文回退；应复用已登录 cookies 直接调用 `/workspaces/api/publication` 下载 PDF
 
 6. 只有同时满足以下条件，才可视为执行成功：
    - 进程正常退出

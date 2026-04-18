@@ -6,6 +6,19 @@ from scripts import hnxcl
 
 
 class VerifiedTextFallbackTests(unittest.TestCase):
+    def test_argus_pdf_source_note_hides_technical_fallback_reason(self):
+        metadata = hnxcl.build_source_metadata(
+            source_type="argus_pdf",
+            source_label="Argus PDF",
+            source_report_date="2026年04月17日",
+            source_name="Argus Asia Bitumen Daily  (2026-04-17).pdf",
+            fallback_reason="legacy publication UI unavailable: pdf button not found; Script error for: requireConfig",
+        )
+
+        self.assertIn("来源: Argus PDF", metadata["argus_source_date_note"])
+        self.assertIn("引用日期: 2026年04月17日", metadata["argus_source_date_note"])
+        self.assertNotIn("回退原因:", metadata["argus_source_date_note"])
+
     def test_loads_explicit_verified_text_fallback_with_source_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             verified_path = Path(tmpdir) / "verified-20260414.txt"
@@ -50,6 +63,20 @@ class VerifiedTextFallbackTests(unittest.TestCase):
         self.assertIn("已核验 Argus 正文文本", source_kind_prompt)
         self.assertIn("不要将其表述为今日新一期已确认内容", source_usage_prompt)
         self.assertIn("2026年04月14日", source_usage_prompt)
+
+    def test_get_asia_bitumen_daily_raises_stage_error_when_all_fetch_paths_fail(self):
+        downloader = hnxcl.ArgusDownloader()
+        downloader.download_publication_pdf = lambda target_date: None
+        downloader.fetch_article_fallback = lambda target_date, fallback_reason: None
+        downloader.fetch_publication_pdf_via_http_fallback = lambda target_date, fallback_reason: None
+        downloader.get_oilchem_asphalt_price = lambda: None
+        downloader.verified_text_path = None
+
+        with self.assertRaises(hnxcl.ArgusStageError) as ctx:
+            downloader.get_asia_bitumen_daily()
+
+        self.assertEqual(ctx.exception.stage, "publications_download")
+        self.assertIn("未获取到可用的 Argus 源内容", str(ctx.exception))
 
 
 if __name__ == "__main__":

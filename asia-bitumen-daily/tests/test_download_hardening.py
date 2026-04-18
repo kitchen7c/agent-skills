@@ -133,6 +133,91 @@ class DownloadHardeningTests(unittest.TestCase):
         self.assertIs(result, expected)
         self.assertEqual(calls, [("agent-browser", "20260417")])
 
+    def test_download_publication_pdf_tries_direct_api_when_state_probe_breaks(self):
+        downloader = hnxcl.ArgusDownloader()
+        expected = hnxcl.FetchResult(
+            source_type="argus_pdf",
+            source_name="Argus Asia Bitumen Daily (20260417).pdf",
+            source_report_date="2026年04月17日",
+        )
+        calls = []
+
+        downloader._download_publication_pdf_via_agent_browser = lambda target_date: (_ for _ in ()).throw(
+            RuntimeError("agent-browser eval --stdin failed")
+        )
+        downloader._fetch_publication_pdf_via_direct_api = lambda target_date, fallback_reason: calls.append(
+            ("direct-api", target_date, fallback_reason)
+        ) or expected
+        downloader.fetch_publication_pdf_via_http_fallback = lambda target_date, fallback_reason: (_ for _ in ()).throw(
+            AssertionError("HTTP fallback should not run when direct API fallback succeeds")
+        )
+
+        result = downloader.download_publication_pdf("20260417")
+
+        self.assertIs(result, expected)
+        self.assertEqual(calls[0][0], "direct-api")
+        self.assertEqual(calls[0][1], "20260417")
+        self.assertIn("agent-browser eval --stdin failed", calls[0][2])
+
+    def test_agent_browser_download_uses_direct_api_when_legacy_iframe_is_blank(self):
+        downloader = hnxcl.ArgusDownloader()
+        expected = hnxcl.FetchResult(
+            source_type="argus_pdf",
+            source_name="Argus Asia Bitumen Daily (20260417).pdf",
+            source_report_date="2026年04月17日",
+        )
+        calls = []
+
+        downloader._agent_browser_login_argus = lambda: {
+            "href": downloader.publication_entrypoint_url(),
+            "hasIframe": True,
+            "hasPdfButton": False,
+            "iframeError": "Script error for: requireConfig",
+        }
+        downloader._fetch_publication_pdf_via_direct_api = lambda target_date, fallback_reason: calls.append(
+            ("direct-api", target_date, fallback_reason)
+        ) or expected
+
+        result = downloader._download_publication_pdf_via_agent_browser("20260417")
+
+        self.assertIs(result, expected)
+        self.assertEqual(
+            calls,
+            [("direct-api", "20260417", "agent-browser authenticated session")],
+        )
+
+    def test_agent_browser_download_prefers_direct_api_before_legacy_ui(self):
+        downloader = hnxcl.ArgusDownloader()
+        expected = hnxcl.FetchResult(
+            source_type="argus_pdf",
+            source_name="Argus Asia Bitumen Daily (20260417).pdf",
+            source_report_date="2026年04月17日",
+        )
+        calls = []
+
+        downloader._agent_browser_login_argus = lambda: {
+            "href": downloader.publication_entrypoint_url(),
+            "hasIframe": True,
+            "hasPdfButton": False,
+            "iframeBlank": True,
+            "iframeError": "Script error for: requireConfig",
+        }
+        downloader._fetch_publication_pdf_via_direct_api = lambda target_date, fallback_reason: calls.append(
+            ("direct-api", target_date, fallback_reason)
+        ) or expected
+        downloader._agent_browser_install_publication_capture = lambda: calls.append("install-capture")
+        downloader._agent_browser_trigger_publication_download = lambda: (_ for _ in ()).throw(
+            AssertionError("legacy UI should not be used when direct API already succeeds")
+        )
+
+        result = downloader._download_publication_pdf_via_agent_browser("20260417")
+
+        self.assertIs(result, expected)
+        self.assertEqual(
+            calls,
+            [("direct-api", "20260417", "agent-browser authenticated session")],
+        )
+
     def test_build_agent_browser_command_includes_session_and_executable(self):
         downloader = hnxcl.ArgusDownloader()
         downloader.agent_browser_executable_path = "/tmp/fake-browser"
@@ -153,6 +238,104 @@ class DownloadHardeningTests(unittest.TestCase):
                 "https://example.com",
             ],
         )
+
+    def test_agent_browser_login_uses_url_probe_when_state_eval_breaks(self):
+        downloader = hnxcl.ArgusDownloader()
+        publication_url = downloader.publication_entrypoint_url()
+
+        def fake_run_agent_browser(args, **kwargs):
+            if args[0] == "open":
+                return ""
+            if args[0] == "get" and args[1] == "url":
+                return publication_url
+            raise AssertionError(f"unexpected agent-browser command: {args}")
+
+        downloader.run_agent_browser = fake_run_agent_browser
+        downloader.agent_browser_wait = lambda *args, **kwargs: None
+        downloader._agent_browser_publication_state = lambda: (_ for _ in ()).throw(
+            RuntimeError("agent-browser eval --stdin failed")
+        )
+        downloader._agent_browser_session_is_authenticated = lambda: True
+
+        with patch.dict(
+            os.environ,
+            {
+                "ARGUS_EMAIL": "user@example.com",
+                "ARGUS_PASSWORD": "secret",
+            },
+        ):
+            state = downloader._agent_browser_login_argus()
+
+        self.assertEqual(state["href"], publication_url)
+        self.assertTrue(state["stateProbeFailed"])
+
+    def test_agent_browser_login_does_not_treat_publication_url_as_authenticated_without_cookies(self):
+        downloader = hnxcl.ArgusDownloader()
+        publication_url = downloader.publication_entrypoint_url()
+
+        def fake_run_agent_browser(args, **kwargs):
+            if args[0] == "open":
+                return ""
+            if args[0] == "get" and args[1] == "url":
+                return publication_url
+            raise AssertionError(f"unexpected agent-browser command: {args}")
+
+        downloader.run_agent_browser = fake_run_agent_browser
+        downloader.agent_browser_wait = lambda *args, **kwargs: None
+        downloader._agent_browser_publication_state = lambda: (_ for _ in ()).throw(
+            RuntimeError("agent-browser eval --stdin failed")
+        )
+        downloader._agent_browser_session_is_authenticated = lambda: False
+
+        with patch.dict(
+            os.environ,
+            {
+                "ARGUS_EMAIL": "user@example.com",
+                "ARGUS_PASSWORD": "secret",
+            },
+        ):
+            with self.assertRaises(hnxcl.ArgusStageError) as ctx:
+                downloader._agent_browser_login_argus()
+
+        self.assertEqual(ctx.exception.stage, "login")
+
+    def test_agent_browser_login_attempts_form_login_when_url_probe_hits_login_page(self):
+        downloader = hnxcl.ArgusDownloader()
+        login_url = "https://myaccount.argusmedia.com/login?ReturnUrl=..."
+        publication_url = downloader.publication_entrypoint_url()
+        calls = []
+
+        url_sequence = iter([login_url, publication_url])
+
+        def fake_run_agent_browser(args, **kwargs):
+            calls.append(list(args))
+            if args[0] == "open":
+                return ""
+            if args[0] == "get" and args[1] == "url":
+                return next(url_sequence)
+            if args[0] in {"fill", "find"}:
+                return ""
+            raise AssertionError(f"unexpected agent-browser command: {args}")
+
+        downloader.run_agent_browser = fake_run_agent_browser
+        downloader.agent_browser_wait = lambda *args, **kwargs: None
+        downloader._agent_browser_publication_state = lambda: (_ for _ in ()).throw(
+            RuntimeError("agent-browser eval --stdin failed")
+        )
+        downloader._agent_browser_session_is_authenticated = lambda: True
+
+        with patch.dict(
+            os.environ,
+            {
+                "ARGUS_EMAIL": "user@example.com",
+                "ARGUS_PASSWORD": "secret",
+            },
+        ):
+            state = downloader._agent_browser_login_argus()
+
+        self.assertEqual(state["href"], publication_url)
+        self.assertIn(["fill", 'input[type="email"]', "user@example.com"], calls)
+        self.assertIn(["fill", 'input[type="password"]', "secret"], calls)
 
     def test_render_html_image_via_agent_browser_outputs_real_jpeg_when_requested(self):
         calls = []

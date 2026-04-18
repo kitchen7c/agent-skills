@@ -1,8 +1,48 @@
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from PIL import Image
 
 from scripts import hnxcl
+
+
+class FakeJsonResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
+
+
+class FakeDingTalkRequests:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url):
+        self.calls.append({"method": "get", "url": url})
+        return FakeJsonResponse({"access_token": "oapi-token"})
+
+    def post(self, url, json=None, files=None, headers=None):
+        self.calls.append(
+            {
+                "method": "post",
+                "url": url,
+                "json": json,
+                "files": files,
+                "headers": headers,
+            }
+        )
+        if url.endswith("/v1.0/oauth2/accessToken"):
+            return FakeJsonResponse({"accessToken": "new-token"})
+        if "media/upload" in url:
+            return FakeJsonResponse({"media_id": "@uploaded-media-id"})
+        if url.endswith("/v1.0/robot/oToMessages/batchSend"):
+            return FakeJsonResponse({"processQueryKey": "sent-key"})
+        return FakeJsonResponse({})
 
 
 class FakePdfResponse:
@@ -114,7 +154,7 @@ class DownloadHardeningTests(unittest.TestCase):
             ],
         )
 
-    def test_render_html_image_via_agent_browser_uses_file_access_and_screenshot_step(self):
+    def test_render_html_image_via_agent_browser_outputs_real_jpeg_when_requested(self):
         calls = []
 
         def fake_runner(args, **kwargs):
@@ -135,13 +175,13 @@ class DownloadHardeningTests(unittest.TestCase):
             if command == "eval":
                 return {"width": 900, "height": 1800}
             if command == "screenshot":
-                Path(args[1]).write_bytes(b"fakepng")
+                Image.new("RGB", (20, 20), "white").save(args[1], format="PNG")
                 return ""
             return ""
 
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "report.html"
-            image_path = Path(tmpdir) / "report.png"
+            image_path = Path(tmpdir) / "report.jpg"
             html_path.write_text("<html><body><div id='report-container'>ok</div></body></html>", encoding="utf-8")
 
             metrics = hnxcl.render_html_image_via_agent_browser(
@@ -152,12 +192,46 @@ class DownloadHardeningTests(unittest.TestCase):
             )
 
             self.assertTrue(image_path.exists())
+            self.assertEqual(image_path.read_bytes()[:2], b"\xff\xd8")
             self.assertEqual(metrics["imageSize"]["width"], "980px")
             self.assertEqual(metrics["imageSize"]["height"], "1880px")
             self.assertEqual(calls[0][0][0], "open")
             self.assertTrue(calls[0][1]["allow_file_access"])
-            self.assertEqual(calls[-1][0][0], "screenshot")
-            self.assertTrue(calls[-1][1]["full_page"])
+            screenshot_calls = [call for call in calls if call[0][0] == "screenshot"]
+            self.assertEqual(len(screenshot_calls), 1)
+            self.assertTrue(screenshot_calls[0][1]["full_page"])
+
+    def test_send_image_to_dingtalk_uses_previewable_image_message(self):
+        fake_requests = FakeDingTalkRequests()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "report.jpg"
+            image_path.write_bytes(b"\xff\xd8fake-jpeg")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "DINGTALK_APP_KEY": "app-key",
+                    "DINGTALK_APP_SECRET": "app-secret",
+                },
+            ), patch.object(hnxcl, "import_requests", return_value=fake_requests):
+                delivered = hnxcl.send_file_to_dingtalk(str(image_path), "42706")
+
+        self.assertTrue(delivered)
+        upload_call = next(call for call in fake_requests.calls if "media/upload" in call["url"])
+        self.assertIn("type=image", upload_call["url"])
+        self.assertEqual(upload_call["files"]["media"][2], "image/jpeg")
+
+        send_call = next(
+            call
+            for call in fake_requests.calls
+            if call["url"].endswith("/v1.0/robot/oToMessages/batchSend")
+        )
+        self.assertEqual(send_call["json"]["msgKey"], "sampleImageMsg")
+        self.assertEqual(
+            json.loads(send_call["json"]["msgParam"]),
+            {"photoURL": "@uploaded-media-id"},
+        )
 
 
 if __name__ == "__main__":

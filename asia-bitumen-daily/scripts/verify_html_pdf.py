@@ -17,7 +17,7 @@ def verify_html_to_image(html_path, image_path=None, keep_debug_html=True):
         output_image_path = prepare_output_path(Path(image_path).resolve())
     else:
         output_image_path = prepare_output_path(
-            source_html_path.with_name(f"{source_html_path.stem}.verified.png")
+            source_html_path.with_name(f"{source_html_path.stem}.verified.jpg")
         )
 
     debug_html_path = prepare_output_path(
@@ -70,9 +70,9 @@ def verify_html_to_image(html_path, image_path=None, keep_debug_html=True):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="验证 HTML 转 PNG 的渲染情况")
+    parser = argparse.ArgumentParser(description="验证 HTML 转 JPEG 的渲染情况")
     parser.add_argument("--html", required=True, help="待验证的 HTML 文件路径")
-    parser.add_argument("--image", default=None, help="输出 PNG 路径，默认在 HTML 同目录生成")
+    parser.add_argument("--image", default=None, help="输出 JPEG 路径，默认在 HTML 同目录生成")
     parser.add_argument(
         "--delete-debug-html",
         action="store_true",
@@ -89,7 +89,7 @@ def main():
         keep_debug_html=not args.delete_debug_html,
     )
 
-    print("HTML 转 PNG 验证完成")
+    print("HTML 转 JPEG 验证完成")
     print(f"图片: {diagnostics['output_image']}")
     print(f"诊断: {diagnostics['diagnostics_json']}")
     print(f"字体状态: {diagnostics['page_metrics']['fontStatus']}")

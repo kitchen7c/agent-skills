@@ -117,6 +117,30 @@ def prepare_output_path(path_like):
     return output_path
 
 
+def convert_image_to_jpeg(source_path, output_path, quality=92):
+    """将浏览器截图转换为真正的 JPEG 文件，避免只改扩展名。"""
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("缺少依赖 Pillow，请先安装 Pillow") from exc
+
+    source_path = Path(source_path)
+    output_path = prepare_output_path(output_path)
+    with Image.open(source_path) as image:
+        image.load()
+        if image.mode in ("RGBA", "LA") or (
+            image.mode == "P" and "transparency" in image.info
+        ):
+            rgba = image.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            rgb_image = background
+        else:
+            rgb_image = image.convert("RGB")
+        rgb_image.save(output_path, format="JPEG", quality=quality, optimize=True)
+    return output_path
+
+
 def filename_matches_target_date(filename, target_yyyymmdd):
     """判断文件名中是否包含目标日期。"""
     stem = Path(filename).name
@@ -674,7 +698,7 @@ def build_source_prompt_context(fetch_result):
         )
 
     return (
-        "最新的英文沥青日报PDF文本内容",
+        "最新的英文沥青日报源文本内容（若来源为 PDF，则为 PDF 提取文本）",
         "补充约束：请严格依据源文本输出，不要补写原文中未确认的内容。",
     )
 
@@ -867,7 +891,7 @@ def compute_single_page_pdf_size(content_width_px, content_height_px, padding_px
 
 
 def resolve_chinese_font_paths(font_dir=DEFAULT_FONT_DIR):
-    """返回可嵌入 PDF HTML 的中文字体 URI。"""
+    """返回可嵌入报告 HTML 的中文字体 URI。"""
     font_dir = Path(font_dir)
     resolved = {}
 
@@ -904,7 +928,7 @@ def font_source_to_css_url(font_source):
 
 
 def build_embedded_font_css(font_sources):
-    """构造 PDF 打印专用字体 CSS，优先使用项目内置字体。"""
+    """构造报告渲染专用字体 CSS，优先使用项目内置字体。"""
     font_faces = []
     if font_sources.get("regular"):
         regular_src = font_source_to_css_url(font_sources["regular"])
@@ -955,7 +979,7 @@ def build_embedded_font_css(font_sources):
 
 
 def inject_pdf_font_styles(html_content, font_css):
-    """把 PDF 打印用的字体样式注入到 HTML 中。"""
+    """把报告渲染用的字体样式注入到 HTML 中。"""
     style_tag = f'\n<style id="pdf-font-fallbacks">\n{font_css}\n</style>\n'
     if "</head>" in html_content:
         return html_content.replace("</head>", f"{style_tag}</head>", 1)
@@ -981,6 +1005,12 @@ def render_html_image_via_agent_browser(
 ):
     source_html_path = Path(html_path).resolve()
     output_image_path = Path(output_image_path).resolve()
+    wants_jpeg = output_image_path.suffix.lower() in {".jpg", ".jpeg"}
+    screenshot_path = (
+        prepare_output_path(output_image_path.with_name(f"{output_image_path.stem}.capture.png"))
+        if wants_jpeg
+        else output_image_path
+    )
 
     runner(
         ["open", source_html_path.as_uri()],
@@ -1029,12 +1059,18 @@ def render_html_image_via_agent_browser(
         session=session_name,
     )
     runner(
-        ["screenshot", str(output_image_path)],
+        ["screenshot", str(screenshot_path)],
         timeout=60,
         allow_file_access=True,
         session=session_name,
         full_page=True,
     )
+    if wants_jpeg:
+        convert_image_to_jpeg(screenshot_path, output_image_path)
+        try:
+            screenshot_path.unlink()
+        except FileNotFoundError:
+            pass
 
     metrics["imageSize"] = {"width": render_width, "height": render_height}
     metrics["captureBox"] = {"width": prepared_width, "height": prepared_height}
@@ -1343,8 +1379,12 @@ def normalize_report_data(report_data, today_date, prices=None):
     }
 
 
+def is_dingtalk_preview_image(file_name):
+    return Path(file_name).suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
+
 def send_file_to_dingtalk(file_path, target_user_ids="42706"):
-    """将文件推送到一个或多个钉钉用户"""
+    """将报告产物推送到一个或多个钉钉用户；图片按可预览图片消息发送。"""
     requests = import_requests()
     client_id = get_required_env("DINGTALK_APP_KEY")
     client_secret = get_required_env("DINGTALK_APP_SECRET")
@@ -1354,11 +1394,13 @@ def send_file_to_dingtalk(file_path, target_user_ids="42706"):
         return False
 
     try:
-        print(f"开始推送文件到钉钉，目标用户: {', '.join(user_id_list)}...")
+        print(f"开始推送报告到钉钉，目标用户: {', '.join(user_id_list)}...")
         file_name = os.path.basename(file_path)
         guessed_type, _ = mimetypes.guess_type(file_name)
         mime_type = guessed_type or "application/octet-stream"
         file_type = Path(file_name).suffix.lower().lstrip(".") or "file"
+        is_preview_image = is_dingtalk_preview_image(file_name)
+        media_type = "image" if is_preview_image else "file"
 
         # 1. 获取 OAPI Access Token
         oapi_url = f"https://oapi.dingtalk.com/gettoken?appkey={client_id}&appsecret={client_secret}"
@@ -1378,30 +1420,35 @@ def send_file_to_dingtalk(file_path, target_user_ids="42706"):
             print(f"获取 New API Token 失败: {new_api_res}")
             return False
 
-        # 3. 上传文件到钉钉媒体库
-        upload_url = f"https://oapi.dingtalk.com/media/upload?access_token={oapi_token}&type=file"
+        # 3. 上传到钉钉媒体库。图片使用 type=image，后续可按图片消息直接预览。
+        upload_url = f"https://oapi.dingtalk.com/media/upload?access_token={oapi_token}&type={media_type}"
         with open(file_path, "rb") as f:
             files = {"media": (file_name, f, mime_type)}
             upload_res = requests.post(upload_url, files=files).json()
 
         media_id = upload_res.get("media_id")
         if not media_id:
-            print(f"文件上传失败: {upload_res}")
+            print(f"媒体上传失败: {upload_res}")
             return False
-        print(f"文件上传成功, media_id: {media_id}")
+        print(f"媒体上传成功, media_id: {media_id}")
 
-        # 4. 发送文件消息
+        # 4. 发送消息。图片走 sampleImageMsg，避免在钉钉端显示为需下载的附件。
         send_url = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
-        msg_param = {
-            "mediaId": media_id,
-            "fileName": file_name,
-            "fileType": file_type,
-        }
+        if is_preview_image:
+            msg_key = "sampleImageMsg"
+            msg_param = {"photoURL": media_id}
+        else:
+            msg_key = "sampleFile"
+            msg_param = {
+                "mediaId": media_id,
+                "fileName": file_name,
+                "fileType": file_type,
+            }
 
         body = {
             "robotCode": client_id,
             "userIds": user_id_list,
-            "msgKey": "sampleFile",
+            "msgKey": msg_key,
             "msgParam": json.dumps(msg_param),
         }
         headers = {
@@ -1411,14 +1458,14 @@ def send_file_to_dingtalk(file_path, target_user_ids="42706"):
 
         send_res = requests.post(send_url, json=body, headers=headers).json()
         if send_res.get("processQueryKey"):
-            print(f"文件推送成功，标识: {send_res['processQueryKey']}")
+            print(f"报告推送成功，标识: {send_res['processQueryKey']}")
             return True
         else:
-            print(f"文件推送响应异常: {send_res}")
+            print(f"报告推送响应异常: {send_res}")
             return False
 
     except Exception as e:
-        print(f"推送文件到钉钉时发生错误: {e}")
+        print(f"推送报告到钉钉时发生错误: {e}")
         return False
 
 
@@ -2197,7 +2244,7 @@ class ArgusDownloader:
         return self.generate_chinese_report_from_text(pdf_text, prices, fetch_result)
 
     def generate_chinese_report_from_text(self, source_text, prices=None, fetch_result=None):
-        """将 PDF 或文章正文统一转换为结构化中文报告并导出 PDF。"""
+        """将 PDF 或文章正文统一转换为结构化中文报告并导出 JPEG 图片。"""
         if not source_text:
             raise ArgusStageError("report_generation", "缺少可用于生成报告的源文本")
 
@@ -2362,9 +2409,9 @@ JSON schema:
                 f.write(new_html_content.strip())
             print(f"-> 中文版 HTML 生成成功，已保存至: {new_html_path}")
 
-            print("4. 正在使用 agent-browser 将 HTML 转换为 PNG...")
+            print("4. 正在使用 agent-browser 将 HTML 转换为 JPEG...")
             new_image_path = prepare_output_path(
-                self.get_target_dir() / f"{base_name}_zh.png"
+                self.get_target_dir() / f"{base_name}_zh.jpg"
             )
 
             image_session = f"argus-html-image-{uuid.uuid4().hex[:8]}"
@@ -2378,7 +2425,7 @@ JSON schema:
             image_height = image_metrics["imageSize"]["height"]
             print(f"-> 图片渲染尺寸: width={image_width}, height={image_height}")
 
-            print(f"-> 中文版 PNG 生成成功，已保存至: {new_image_path}")
+            print(f"-> 中文版 JPEG 生成成功，已保存至: {new_image_path}")
 
             # 推送生成的图片给指定用户
             delivered = send_file_to_dingtalk(str(new_image_path), self.target_user_ids)
@@ -2389,7 +2436,7 @@ JSON schema:
             return new_image_path
 
         except Exception as e:
-            raise ArgusStageError("report_generation", f"大模型调用或PDF生成过程中发生错误: {e}") from e
+            raise ArgusStageError("report_generation", f"大模型调用或图片生成过程中发生错误: {e}") from e
 
     def get_prices_data(self):
         """获取首页 Prices 模块的表格数据"""
@@ -2532,7 +2579,7 @@ def main():
         "--output-dir",
         type=str,
         default=None,
-        help="指定报告输出根目录；源 PDF 和生成后的 PDF 会写入其中的运行当天日期目录（若传入的已是当天日期目录则直接使用）",
+        help="指定报告输出根目录；源 PDF 与最终生成的 JPEG 图片会写入其中的运行当天日期目录（若传入的已是当天日期目录则直接使用）",
     )
     parser.add_argument(
         "--verified-text-path",

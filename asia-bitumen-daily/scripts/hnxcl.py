@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -166,6 +166,20 @@ def extract_report_date_from_filename(filename):
     return "-"
 
 
+def format_report_date_cn(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return "-"
+    if re.fullmatch(r"20\d{2}年\d{2}月\d{2}日", raw):
+        return raw
+
+    compact = extract_report_date_compact(raw)
+    if compact:
+        return datetime.strptime(compact, "%Y%m%d").strftime("%Y年%m月%d日")
+
+    raise ValueError(f"无法解析报告日期: {raw}")
+
+
 def extract_report_date_compact(text):
     raw = (text or "").strip()
     if not raw:
@@ -238,6 +252,31 @@ class ArgusStageError(RuntimeError):
     def __init__(self, stage, message):
         super().__init__(message)
         self.stage = stage
+
+
+def load_verified_text_fallback(
+    verified_text_path,
+    verified_report_date,
+    fallback_reason=None,
+):
+    artifact_path = Path(verified_text_path).expanduser().resolve()
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"已核验正文文件不存在: {artifact_path}")
+
+    text_content = artifact_path.read_text(encoding="utf-8").strip()
+    if not text_content:
+        raise ValueError(f"已核验正文文件为空: {artifact_path}")
+
+    source_report_date = format_report_date_cn(verified_report_date)
+    return FetchResult(
+        source_type="verified_text_fallback",
+        source_name=artifact_path.name,
+        source_report_date=source_report_date,
+        artifact_path=artifact_path,
+        text_content=text_content,
+        fallback_reason=fallback_reason
+        or f"显式沿用 {source_report_date} 最新已核验正文，不假设新一期内容不变",
+    )
 
 
 def determine_exit_code(exc):
@@ -606,6 +645,7 @@ def build_source_metadata(
     mode_label = {
         "argus_pdf": "Argus PDF",
         "argus_direct_article_fallback": "Argus Direct 文章回退",
+        "verified_text_fallback": "已核验正文回退",
     }.get(source_type, source_type)
 
     note_parts = [f"来源: {mode_label}", f"引用日期: {source_report_date or '-'}"]
@@ -616,6 +656,114 @@ def build_source_metadata(
         "argus_source_date_note": " | ".join(note_parts),
         "argus_source_file": f"{source_name or source_label or '-'}、隆众资讯",
     }
+
+
+def build_source_prompt_context(fetch_result):
+    if fetch_result and fetch_result.source_type == "verified_text_fallback":
+        source_date = fetch_result.source_report_date or "-"
+        return (
+            "已核验 Argus 正文文本（非当日新一期正文）",
+            (
+                f"补充约束：当前供需口径只能显式沿用 {source_date} 最新已核验正文；"
+                "不要将其表述为今日新一期已确认内容，不要假设新一期内容不变；"
+                "若引用供需、成交、装船或区域流向，请写成基于已核验正文的沿用口径。"
+            ),
+        )
+
+    if fetch_result and fetch_result.source_type == "argus_direct_article_fallback":
+        return (
+            "Argus Direct 文章正文内容",
+            "补充约束：正文来自 Argus Direct 文章页回退，请仅依据原文可确认信息输出，不要补写未验证的新一期细节。",
+        )
+
+    return (
+        "最新的英文沥青日报PDF文本内容",
+        "补充约束：请严格依据源文本输出，不要补写原文中未确认的内容。",
+    )
+
+
+def iter_document_surfaces(page):
+    """返回主页面及其嵌套 frame，避免站点把内容迁移到 iframe 后完全失明。"""
+    if page is None:
+        return []
+
+    surfaces = []
+    seen_ids = set()
+    queue = [page]
+
+    while queue:
+        surface = queue.pop(0)
+        marker = id(surface)
+        if marker in seen_ids:
+            continue
+        seen_ids.add(marker)
+        surfaces.append(surface)
+
+        child_frames = getattr(surface, "frames", None) or []
+        for frame in child_frames:
+            if frame is surface:
+                continue
+            queue.append(frame)
+
+    return surfaces
+
+
+def discover_followup_urls(base_url, html_text):
+    """从 HTML/内联脚本里提取后续可尝试的 URL。"""
+    discovered = []
+    seen = set()
+
+    def push(raw_url):
+        if not raw_url:
+            return
+        absolute = urljoin(base_url, html.unescape(raw_url))
+        lowered = absolute.lower()
+        if absolute in seen:
+            return
+        if not any(
+            token in lowered
+            for token in (
+                ".pdf",
+                "publication",
+                "download",
+                "integration",
+                "api",
+            )
+        ):
+            return
+        seen.add(absolute)
+        discovered.append(absolute)
+
+    for match in re.findall(r'(?:src|href)=["\']([^"\']+)["\']', html_text or "", flags=re.I):
+        push(match)
+
+    for match in re.findall(
+        r'["\'](https?:\/\/[^"\']+|\/[^"\']*(?:pdf|publication|download|integration|api)[^"\']*)["\']',
+        html_text or "",
+        flags=re.I,
+    ):
+        push(match)
+
+    return discovered
+
+
+def extract_filename_from_content_disposition(header_value):
+    if not header_value:
+        return None
+
+    utf8_match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", header_value, flags=re.I)
+    if utf8_match:
+        return unquote(utf8_match.group(1))
+
+    plain_match = re.search(r'filename\s*=\s*"([^"]+)"', header_value, flags=re.I)
+    if plain_match:
+        return plain_match.group(1)
+
+    plain_match = re.search(r"filename\s*=\s*([^;]+)", header_value, flags=re.I)
+    if plain_match:
+        return plain_match.group(1).strip()
+
+    return None
 
 
 def compute_single_page_pdf_size(content_width_px, content_height_px, padding_px=80):
@@ -1109,7 +1257,14 @@ def send_pdf_to_dingtalk(file_path, target_user_ids="42706"):
 
 
 class ArgusDownloader:
-    def __init__(self, headless=True, target_user_id="42706", output_dir=None):
+    def __init__(
+        self,
+        headless=True,
+        target_user_id="42706",
+        output_dir=None,
+        verified_text_path=None,
+        verified_report_date=None,
+    ):
         self.headless = headless
         self.target_user_ids = parse_target_user_ids(target_user_id)
         self.output_dir = ensure_output_dir(output_dir)
@@ -1121,6 +1276,21 @@ class ArgusDownloader:
         self.publication_id = os.environ.get(
             "ARGUS_ASIA_BITUMEN_PUBLICATION_ID", DEFAULT_ARGUS_PUBLICATION_ID
         )
+        raw_verified_text_path = verified_text_path or os.environ.get("ARGUS_VERIFIED_TEXT_PATH")
+        self.verified_text_path = (
+            os.path.abspath(os.path.expanduser(raw_verified_text_path))
+            if raw_verified_text_path
+            else None
+        )
+        self.verified_report_date = (
+            verified_report_date or os.environ.get("ARGUS_VERIFIED_TEXT_DATE")
+        )
+
+    def publication_entrypoint_url(self):
+        return f"https://direct.argusmedia.com/publication?publicationId={self.publication_id}"
+
+    def integration_publication_url(self):
+        return f"https://direct.argusmedia.com/integration/publication?publicationId={self.publication_id}"
 
     @staticmethod
     def current_report_date():
@@ -1196,6 +1366,159 @@ class ArgusDownloader:
         print(f"[warning][{stage}] {message}")
         return warning
 
+    def get_document_surfaces(self):
+        surfaces = iter_document_surfaces(self.page)
+
+        def surface_rank(surface):
+            url = self._surface_url(surface)
+            if url == self.integration_publication_url():
+                return (0, 0)
+            if url == self.publication_entrypoint_url():
+                return (1, 0)
+            if url and url != "about:blank":
+                return (2, 0)
+            return (3, 0)
+
+        return sorted(surfaces, key=surface_rank)
+
+    def _surface_url(self, surface):
+        return getattr(surface, "url", "") or ""
+
+    def _surface_matches_target_publication(self, surface):
+        return self._surface_url(surface) in {
+            self.publication_entrypoint_url(),
+            self.integration_publication_url(),
+        }
+
+    def _read_locator_text(self, locator):
+        try:
+            return locator.first.inner_text(timeout=2000).strip()
+        except Exception:
+            return ""
+
+    def _read_locator_value(self, locator):
+        try:
+            value = locator.first.input_value(timeout=1500)
+            if value:
+                return value.strip()
+        except Exception:
+            pass
+
+        try:
+            value = locator.first.get_attribute("value")
+            if value:
+                return value.strip()
+        except Exception:
+            pass
+
+        return ""
+
+    def _get_direct_publication_metadata(self, surface):
+        if not self._surface_matches_target_publication(surface):
+            return None
+
+        try:
+            surface.locator("#pdf-button").first.wait_for(state="attached", timeout=3000)
+        except Exception:
+            return None
+
+        heading = self._read_locator_text(surface.locator("#publication-preview").locator("h2"))
+        if not heading:
+            heading = self._read_locator_text(surface.locator("h2"))
+        if not heading or "argus asia bitumen daily" not in heading.lower():
+            heading = "Argus Asia Bitumen Daily"
+
+        date_text = ""
+        for selector in ("#date-picker", "#alt-date", "input.date-input"):
+            date_text = self._read_locator_value(surface.locator(selector))
+            if date_text:
+                break
+
+        preview_text = self._read_locator_text(surface.locator("#publication-preview"))
+        return {
+            "heading": heading,
+            "date_text": date_text,
+            "preview_text": preview_text,
+        }
+
+    def _collect_direct_publication_candidate(self, surface, target_date):
+        metadata = self._get_direct_publication_metadata(surface)
+        if not metadata:
+            return None
+        preview = surface.locator("#publication-preview")
+        heading = metadata["heading"]
+        date_text = metadata["date_text"]
+        preview_text = metadata["preview_text"] or heading
+        candidate_text = "\n".join(
+            part for part in (heading, "Download PDF", date_text, preview_text) if part
+        )
+        score = score_publication_candidate({"text": candidate_text}, target_date)
+        if score <= 0:
+            return None
+
+        return {
+            "row": preview.first,
+            "text": candidate_text,
+            "score": score,
+            "surface": surface,
+            "surface_url": self._surface_url(surface),
+        }
+
+    def _collect_surface_candidates(self, surface, target_date):
+        direct_candidate = self._collect_direct_publication_candidate(surface, target_date)
+        if direct_candidate:
+            return [direct_candidate]
+
+        publication_menu_rows = surface.locator(
+            ".scrollable-menu-container li.publication-item"
+        ).filter(has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I))
+        if publication_menu_rows.count():
+            rows = publication_menu_rows
+        else:
+            rows = surface.locator("div, li, tr, article, section").filter(
+                has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I)
+            )
+
+        count = min(rows.count(), 60)
+        candidates = []
+        for index in range(count):
+            row = rows.nth(index)
+            try:
+                text = row.inner_text(timeout=2000).strip()
+            except Exception:
+                continue
+            score = score_publication_candidate({"text": text}, target_date)
+            if not text or score <= 0:
+                continue
+            candidates.append(
+                {
+                    "row": row,
+                    "text": text,
+                    "score": score,
+                    "surface": surface,
+                    "surface_url": self._surface_url(surface),
+                }
+            )
+        return candidates
+
+    def load_explicit_verified_text_fallback(self, fallback_reason):
+        if not self.verified_text_path:
+            return None
+        if not self.verified_report_date:
+            raise ArgusStageError(
+                "article_fallback",
+                "已提供已核验正文文件，但缺少核验日期 (--verified-report-date 或 ARGUS_VERIFIED_TEXT_DATE)",
+            )
+
+        try:
+            return load_verified_text_fallback(
+                verified_text_path=self.verified_text_path,
+                verified_report_date=self.verified_report_date,
+                fallback_reason=fallback_reason,
+            )
+        except Exception as exc:
+            raise ArgusStageError("article_fallback", f"加载已核验正文回退失败: {exc}") from exc
+
     def _extract_candidate_title(self, candidate):
         text = candidate.get("text") or ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -1208,11 +1531,12 @@ class ArgusDownloader:
 
     def _resolve_candidate_interactive_row(self, candidate):
         row = candidate["row"]
+        surface = candidate.get("surface") or self.page
         title = self._extract_candidate_title(candidate)
 
         strategies = [
-            lambda: self.page.locator("li.publication-item").filter(has_text=title).first,
-            lambda: self.page.locator(".preview-row").filter(has_text=title).first,
+            lambda: surface.locator("li.publication-item").filter(has_text=title).first,
+            lambda: surface.locator(".preview-row").filter(has_text=title).first,
             lambda: row.locator("xpath=ancestor-or-self::*[contains(@class, 'preview-row')][1]").first,
             lambda: row.locator("xpath=ancestor-or-self::*[contains(@class, 'publication-item')][1]").first,
             lambda: row,
@@ -1256,6 +1580,7 @@ class ArgusDownloader:
         row = self._resolve_candidate_interactive_row(candidate)
         click_targets = [
             lambda: row.locator("#pdf-link").first,
+            lambda: row.locator("#pdf-button").first,
             lambda: row.locator("a.publication-item-link").filter(has_text=re.compile(r"^PDF$", re.I)).first,
             lambda: row.get_by_role("link", name=re.compile(r"PDF|Download", re.I)).first,
             lambda: row.get_by_role("button", name=re.compile(r"PDF|Download", re.I)).first,
@@ -1280,75 +1605,65 @@ class ArgusDownloader:
                 last_error = exc
         raise RuntimeError(f"无法点击 PDF/Download 动作: {last_error}")
 
-    def ensure_markets_publications_view(self):
-        """优先进入 markets 页面下的 Publications 列表，因为该页面存在稳定的 publication-item 结构。"""
-        if "/markets" not in self.page.url:
-            self.page.goto("https://direct.argusmedia.com/markets")
+    def ensure_target_publication_view(self):
+        """优先进入目标 publication 页面，并识别 iframe 内稳定控件。"""
+        if self.page.url != self.publication_entrypoint_url():
+            self.page.goto(self.publication_entrypoint_url())
             self.page.wait_for_load_state("load")
         self.page.wait_for_timeout(1200)
-        try:
-            self.page.locator(".scrollable-menu-container li.publication-item").first.wait_for(
-                state="attached", timeout=8000
-            )
-            return "markets_publications"
-        except Exception:
-            return None
+        for surface in self.get_document_surfaces():
+            try:
+                surface.locator("#pdf-button").first.wait_for(state="attached", timeout=3000)
+                return "direct_publication_iframe" if surface is not self.page else "direct_publication_page"
+            except Exception:
+                try:
+                    surface.locator("#publication-library").first.wait_for(
+                        state="attached", timeout=3000
+                    )
+                    return "direct_publication_iframe" if surface is not self.page else "direct_publication_page"
+                except Exception:
+                    continue
+        return None
 
     def open_publications_menu(self):
         """使用多套定位策略打开 Publications 菜单。"""
-        markets_mode = self.ensure_markets_publications_view()
-        if markets_mode:
-            print(f"已进入 Publications 列表视图: {markets_mode}")
-            return markets_mode
-
-        strategies = [
-            ("role_button", lambda: self.page.get_by_role("button", name=re.compile(r"Publications", re.I)).first),
-            ("role_link", lambda: self.page.get_by_role("link", name=re.compile(r"Publications", re.I)).first),
-            ("nav_text", lambda: self.page.locator("nav, header, [role='navigation']").get_by_text("Publications").first),
-            ("page_text", lambda: self.page.get_by_text("Publications", exact=True).first),
-        ]
+        direct_mode = self.ensure_target_publication_view()
+        if direct_mode:
+            print(f"已进入目标 Publications 页面: {direct_mode}")
+            return direct_mode
 
         last_error = None
-        for strategy_name, locator_factory in strategies:
-            try:
-                locator = locator_factory()
-                locator.wait_for(state="visible", timeout=5000)
-                locator.click(timeout=5000)
-                self.page.wait_for_timeout(1000)
-                print(f"已通过策略打开 Publications: {strategy_name}")
-                return strategy_name
-            except Exception as exc:
-                last_error = exc
+        for surface in self.get_document_surfaces():
+            strategies = [
+                ("role_button", lambda surface=surface: surface.get_by_role("button", name=re.compile(r"Publications", re.I)).first),
+                ("role_link", lambda surface=surface: surface.get_by_role("link", name=re.compile(r"Publications", re.I)).first),
+                ("nav_text", lambda surface=surface: surface.locator("nav, header, [role='navigation']").get_by_text("Publications").first),
+                ("page_text", lambda surface=surface: surface.get_by_text("Publications", exact=True).first),
+            ]
+
+            for strategy_name, locator_factory in strategies:
+                try:
+                    locator = locator_factory()
+                    locator.wait_for(state="visible", timeout=5000)
+                    locator.click(timeout=5000)
+                    self.page.wait_for_timeout(1000)
+                    print(f"已通过策略打开 Publications: {strategy_name} @ {self._surface_url(surface) or 'surface'}")
+                    return strategy_name
+                except Exception as exc:
+                    last_error = exc
 
         raise ArgusStageError("publications_download", f"无法定位 Publications 菜单: {last_error}")
 
     def collect_publication_candidates(self, target_date):
         """按语义枚举与目标刊物相关的候选节点，兼容新版页面结构变化。"""
-        publication_menu_rows = self.page.locator(
-            ".scrollable-menu-container li.publication-item"
-        ).filter(has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I))
-        if publication_menu_rows.count():
-            rows = publication_menu_rows
-        else:
-            rows = self.page.locator("div, li, tr, article, section").filter(
-                has_text=re.compile(r"Argus|Bitumen|Daily|Report|Asia", re.I)
-            )
-        count = min(rows.count(), 60)
         candidates = []
         seen_texts = set()
-        for index in range(count):
-            row = rows.nth(index)
-            try:
-                text = row.inner_text(timeout=2000).strip()
-            except Exception:
-                continue
-            if not text or text in seen_texts:
-                continue
-            score = score_publication_candidate({"text": text}, target_date)
-            if score <= 0:
-                continue
-            seen_texts.add(text)
-            candidates.append({"row": row, "text": text, "score": score})
+        for surface in self.get_document_surfaces():
+            for candidate in self._collect_surface_candidates(surface, target_date):
+                if candidate["text"] in seen_texts:
+                    continue
+                seen_texts.add(candidate["text"])
+                candidates.append(candidate)
         return candidates
 
     def locate_publication_download_row(self):
@@ -1364,16 +1679,17 @@ class ArgusDownloader:
             re.compile(r"Asia bitumen daily", re.I),
             re.compile(r"Argus Asia Bitumen Daily", re.I),
         ]
-        for pattern in patterns:
-            for locator in (
-                self.page.get_by_role("link", name=pattern),
-                self.page.get_by_text(pattern),
-            ):
-                try:
-                    locator.first.wait_for(state="visible", timeout=3000)
-                    return locator.first
-                except Exception:
-                    continue
+        for surface in self.get_document_surfaces():
+            for pattern in patterns:
+                for locator in (
+                    surface.get_by_role("link", name=pattern),
+                    surface.get_by_text(pattern),
+                ):
+                    try:
+                        locator.first.wait_for(state="visible", timeout=3000)
+                        return locator.first
+                    except Exception:
+                        continue
         return None
 
     def find_today_report_download(self, target_date):
@@ -1431,6 +1747,266 @@ class ArgusDownloader:
             }
         )
         return session
+
+    def _build_pdf_fetch_result(self, pdf_bytes, file_name, target_date, stage, fallback_reason=None):
+        file_name = file_name or f"Argus Asia Bitumen Daily ({target_date}).pdf"
+        download_path = prepare_output_path(self.get_target_dir() / Path(file_name).name)
+        download_path.write_bytes(pdf_bytes)
+
+        if not self.is_expected_report_file(download_path, target_date):
+            raise ArgusStageError(
+                stage,
+                f"下载的 PDF 不在允许日期窗口内: {download_path.name}",
+            )
+
+        return FetchResult(
+            source_type="argus_pdf",
+            source_name=download_path.name,
+            source_report_date=extract_report_date_from_filename(download_path.name),
+            pdf_path=download_path,
+            artifact_path=download_path,
+            fallback_reason=fallback_reason,
+        )
+
+    def _build_pdf_fetch_result_from_response(self, response, target_date, stage, fallback_reason=None):
+        headers = getattr(response, "headers", {}) or {}
+        content_type = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+        body = response.body()
+        if "application/pdf" not in content_type and not (body or b"").startswith(b"%PDF-"):
+            return None
+
+        file_name = extract_filename_from_content_disposition(
+            headers.get("content-disposition") or headers.get("Content-Disposition")
+        )
+        if not file_name:
+            response_url = str(getattr(response, "url", "") or "")
+            file_name = Path(urlparse(response_url).path).name or f"Argus Asia Bitumen Daily ({target_date}).pdf"
+
+        return self._build_pdf_fetch_result(
+            body,
+            file_name=file_name,
+            target_date=target_date,
+            stage=stage,
+            fallback_reason=fallback_reason,
+        )
+
+    def _fetch_pdf_from_candidate_urls(self, candidate_urls, target_date, stage, fallback_reason=None):
+        session = self.build_requests_session_from_browser()
+        attempted = set()
+
+        for url in candidate_urls:
+            if not url or url in attempted:
+                continue
+            attempted.add(url)
+            try:
+                response = session.get(url, timeout=30, allow_redirects=True)
+            except Exception as exc:
+                self.add_warning(stage, f"候选 URL 拉取失败: {url} -> {exc}")
+                continue
+
+            final_url = str(response.url)
+            content_type = (response.headers.get("content-type") or "").lower()
+            body = response.content or b""
+            if "application/pdf" not in content_type and not body.startswith(b"%PDF-"):
+                continue
+
+            file_name = Path(urlparse(final_url).path).name or f"Argus Asia Bitumen Daily ({target_date}).pdf"
+            return self._build_pdf_fetch_result(
+                body,
+                file_name=file_name,
+                target_date=target_date,
+                stage=stage,
+                fallback_reason=fallback_reason,
+            )
+
+        return None
+
+    def _collect_surface_followup_urls(self):
+        urls = []
+        seen = set()
+
+        def push(url):
+            if not url or url in seen:
+                return
+            seen.add(url)
+            urls.append(url)
+
+        context_pages = list(getattr(self.context, "pages", []) or [])
+        if self.page and self.page not in context_pages:
+            context_pages.append(self.page)
+
+        for page in context_pages:
+            for surface in iter_document_surfaces(page):
+                surface_url = self._surface_url(surface)
+                if surface_url:
+                    push(surface_url)
+                try:
+                    html_text = surface.content()
+                except Exception:
+                    html_text = ""
+                for discovered in discover_followup_urls(surface_url or self.page.url, html_text):
+                    push(discovered)
+
+        return urls
+
+    def _download_candidate_via_browser_download(self, selected, target_date):
+        with self.page.expect_download(timeout=15000) as download_info:
+            self._click_candidate_for_pdf(selected)
+        download = download_info.value
+        file_name = download.suggested_filename or f"Argus Asia Bitumen Daily ({target_date}).pdf"
+        download_path = prepare_output_path(self.get_target_dir() / file_name)
+        download.save_as(str(download_path))
+
+        if not self.is_expected_report_file(download_path, target_date):
+            raise ArgusStageError(
+                "publications_download",
+                f"下载的 PDF 不在允许日期窗口内: {download_path.name}",
+            )
+
+        return FetchResult(
+            source_type="argus_pdf",
+            source_name=file_name,
+            source_report_date=extract_report_date_from_filename(file_name),
+            pdf_path=download_path,
+            artifact_path=download_path,
+        )
+
+    def _download_candidate_via_page_pdf_capture(self, selected, target_date, fallback_reason):
+        print(f"进入备用 PDF 捕获流程，原因: {fallback_reason}")
+        candidate_urls = []
+        seen_urls = set()
+        direct_pdf_results = []
+
+        def push(url):
+            if not url or url in seen_urls:
+                return
+            seen_urls.add(url)
+            candidate_urls.append(url)
+
+        def on_response(response):
+            try:
+                response_url = str(response.url)
+                headers = response.headers or {}
+                content_type = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+                if "application/pdf" in content_type:
+                    pdf_result = self._build_pdf_fetch_result_from_response(
+                        response,
+                        target_date=target_date,
+                        stage="publications_download",
+                        fallback_reason=fallback_reason,
+                    )
+                    if pdf_result:
+                        direct_pdf_results.append(pdf_result)
+                        return
+                lowered = response_url.lower()
+                if "application/pdf" in content_type or any(
+                    token in lowered for token in (".pdf", "download", "publication", "integration")
+                ):
+                    push(response_url)
+            except Exception:
+                return
+
+        if self.context:
+            try:
+                self.context.on("response", on_response)
+            except Exception:
+                pass
+
+        try:
+            self._click_candidate_for_pdf(selected)
+        finally:
+            try:
+                self.page.wait_for_timeout(2500)
+            except Exception:
+                pass
+            if self.context:
+                try:
+                    self.context.remove_listener("response", on_response)
+                except Exception:
+                    pass
+
+        if direct_pdf_results:
+            return direct_pdf_results[0]
+
+        for url in self._collect_surface_followup_urls():
+            push(url)
+
+        fetch_result = self._fetch_pdf_from_candidate_urls(
+            candidate_urls,
+            target_date=target_date,
+            stage="publications_download",
+            fallback_reason=fallback_reason,
+        )
+        if fetch_result:
+            return fetch_result
+
+        raise ArgusStageError("publications_download", "备用 PDF 捕获失败: 未拿到可用 PDF")
+
+    def _get_target_publication_surface(self):
+        for surface in self.get_document_surfaces():
+            if self._surface_url(surface) == self.integration_publication_url():
+                return surface
+        for surface in self.get_document_surfaces():
+            if self._surface_matches_target_publication(surface):
+                return surface
+        return None
+
+    def _download_publication_pdf_direct(self, target_date):
+        print("正在打开目标 publication 页面...")
+        direct_mode = self.ensure_target_publication_view()
+        if not direct_mode:
+            raise ArgusStageError("publications_download", "未能进入目标 publication 页面")
+
+        surface = self._get_target_publication_surface()
+        if surface is None:
+            raise ArgusStageError("publications_download", "未找到目标 publication surface")
+
+        metadata = self._get_direct_publication_metadata(surface)
+        if not metadata:
+            raise ArgusStageError("publications_download", "目标 publication 页面未解析到下载按钮")
+
+        print(f"已进入目标 Publications 页面: {direct_mode}")
+        direct_label = "\n".join(
+            part
+            for part in (metadata["heading"], "Download PDF", metadata["date_text"])
+            if part
+        )
+        print(f"准备下载候选项: {direct_label}")
+        try:
+            with self.page.expect_response(
+                lambda response: "/workspaces/api/publication" in response.url
+                and response.request.method == "POST",
+                timeout=20000,
+            ) as response_info:
+                surface.locator("#pdf-button").first.click(timeout=5000)
+            response = response_info.value
+            result = self._build_pdf_fetch_result_from_response(
+                response,
+                target_date=target_date,
+                stage="publications_download",
+                fallback_reason="direct_publication_api",
+            )
+            if result:
+                print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
+                return result
+        except Exception as exc:
+            self.add_warning("publications_download", f"精确路径 API 下载失败: {exc}")
+
+        try:
+            result = self._download_candidate_via_page_pdf_capture(
+                {
+                    "row": surface.locator("#publication-preview").first,
+                    "text": direct_label,
+                    "surface": surface,
+                    "surface_url": self._surface_url(surface),
+                },
+                target_date,
+                fallback_reason="direct_publication_api_fallback",
+            )
+            print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
+            return result
+        except Exception as exc:
+            raise ArgusStageError("publications_download", f"精确路径下载失败: {exc}") from exc
 
     def fetch_publication_pdf_via_http_fallback(self, target_date, fallback_reason):
         print(f"进入认证 HTTP 回退流程，原因: {fallback_reason}")
@@ -1492,29 +2068,21 @@ class ArgusDownloader:
                 )
                 continue
 
-            discovered = []
-            for match in re.findall(r'(?:src|href)=["\']([^"\']+)["\']', html_text, flags=re.I):
-                absolute = urljoin(final_url, html.unescape(match))
-                if absolute in attempted or absolute in pending_urls:
-                    continue
-                if not any(
-                    token in absolute.lower()
-                    for token in (
-                        ".pdf",
-                        "publication",
-                        "download",
-                        "integration",
-                        "api",
-                    )
-                ):
-                    continue
-                discovered.append(absolute)
-
+            discovered = [
+                url
+                for url in discover_followup_urls(final_url, html_text)
+                if url not in attempted and url not in pending_urls
+            ]
             pending_urls.extend(discovered[:5])
 
         raise ArgusStageError("article_fallback", "认证 HTTP 回退失败: 未解析到可下载 PDF")
 
     def download_publication_pdf(self, target_date):
+        try:
+            return self._download_publication_pdf_direct(target_date)
+        except Exception as exc:
+            self.add_warning("publications_download", f"精确下载路径失败，回退到候选扫描: {exc}")
+
         print("正在打开 Publications 菜单...")
         self.open_publications_menu()
         self.page.wait_for_timeout(1500)
@@ -1524,30 +2092,16 @@ class ArgusDownloader:
             raise ArgusStageError("publications_download", "未找到匹配的 Argus Asia Bitumen Daily 候选项")
         print(f"准备下载候选项: {selected['text']}")
         try:
-            with self.page.expect_download(timeout=15000) as download_info:
-                self._click_candidate_for_pdf(selected)
-            download = download_info.value
+            result = self._download_candidate_via_browser_download(selected, target_date)
         except Exception as exc:
-            raise ArgusStageError("publications_download", f"点击 PDF 下载失败: {exc}") from exc
-
-        file_name = download.suggested_filename or f"Argus Asia Bitumen Daily ({target_date}).pdf"
-        download_path = prepare_output_path(self.get_target_dir() / file_name)
-        download.save_as(str(download_path))
-
-        if not self.is_expected_report_file(download_path, target_date):
-            raise ArgusStageError(
-                "publications_download",
-                f"下载的 PDF 不在允许日期窗口内: {download_path.name}",
+            result = self._download_candidate_via_page_pdf_capture(
+                selected,
+                target_date,
+                fallback_reason=f"浏览器下载事件失败: {exc}",
             )
 
-        print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {download_path}")
-        return FetchResult(
-            source_type="argus_pdf",
-            source_name=file_name,
-            source_report_date=extract_report_date_from_filename(file_name),
-            pdf_path=download_path,
-            artifact_path=download_path,
-        )
+        print(f"『Argus Asia Bitumen Daily』PDF 下载完成: {result.pdf_path}")
+        return result
 
     def fetch_article_fallback(self, target_date, fallback_reason):
         """下载失败时，尝试打开 Argus Direct 文章页并提取正文文本。"""
@@ -1625,7 +2179,7 @@ class ArgusDownloader:
         argus_password = get_required_env("ARGUS_PASSWORD")
 
         print("正在访问网站...")
-        self.page.goto("https://direct.argusmedia.com/")
+        self.page.goto(self.publication_entrypoint_url())
 
         # 1. 登录流程 - 输入邮箱
         self.page.wait_for_selector('input[type="email"]')
@@ -1680,10 +2234,26 @@ class ArgusDownloader:
                 self.capture_debug_artifacts("article_fallback", str(exc))
 
         if fetch_result is None:
-            fetch_result = self.fetch_publication_pdf_via_http_fallback(
-                target_date,
-                primary_error or "Publications/article fallback failed",
+            try:
+                fetch_result = self.fetch_publication_pdf_via_http_fallback(
+                    target_date,
+                    primary_error or "Publications/article fallback failed",
+                )
+            except Exception as exc:
+                self.add_warning("article_fallback", str(exc))
+                self.capture_debug_artifacts("article_fallback", str(exc))
+
+        if fetch_result is None and self.verified_text_path:
+            verified_date_cn = (
+                format_report_date_cn(self.verified_report_date)
+                if self.verified_report_date
+                else "-"
             )
+            fallback_reason = (
+                f"{primary_error or 'Argus 自动抓取失败'}；"
+                f"显式沿用 {verified_date_cn} 最新已核验正文，不假设新一期内容不变"
+            )
+            fetch_result = self.load_explicit_verified_text_fallback(fallback_reason)
 
         # 获取隆众沥青价格
         try:
@@ -1775,11 +2345,7 @@ class ArgusDownloader:
                 f"- {candidate}" for candidate in news_candidates
             ) or "- 未识别到明确新闻句，请仅使用原文中能确认的事件。"
 
-            source_kind_prompt = (
-                "最新的英文沥青日报PDF文本内容"
-                if fetch_result and fetch_result.source_type == "argus_pdf"
-                else "Argus Direct 文章正文内容"
-            )
+            source_kind_prompt, source_usage_prompt = build_source_prompt_context(fetch_result)
 
             prompt = f"""
 你是一个专业的沥青行业分析师。
@@ -1800,6 +2366,7 @@ class ArgusDownloader:
 12. `main_price` 与 `main_price_status` 必须填写上海主力合约的价格与相对前一交易日变动；若原文表述为持平，`main_price_status` 填 `持平`。
 13. `price_strip` 中前 3 项必须填写 FOB 新加坡、韩国、伊朗的价格与相对前一日变动；`status` 统一填写 `▲数字`、`▼数字` 或 `持平`，不要留 `-`，除非原文完全没有该项数据。
 14. `chart.previous_date` 必须填写前一交易日日期；`chart.items.current` 与 `chart.items.previous` 必须与前 3 项 FOB 价格变化保持一致。
+15. {source_usage_prompt}
 
 候选行业动态原文：
 {news_candidates_prompt}
@@ -2122,6 +2689,18 @@ def main():
         default=None,
         help="指定报告输出根目录；源 PDF 和生成后的 PDF 会写入其中的运行当天日期目录（若传入的已是当天日期目录则直接使用）",
     )
+    parser.add_argument(
+        "--verified-text-path",
+        type=str,
+        default=None,
+        help="显式指定已核验正文文本文件；仅在自动抓取全部失败时作为最终回退输入使用",
+    )
+    parser.add_argument(
+        "--verified-report-date",
+        type=str,
+        default=None,
+        help="已核验正文对应的报告日期，例如 2026-04-14；与 --verified-text-path 配套使用",
+    )
 
     args = parser.parse_args()
 
@@ -2129,6 +2708,8 @@ def main():
         headless=args.headless,
         target_user_id=args.user_id,
         output_dir=args.output_dir,
+        verified_text_path=args.verified_text_path,
+        verified_report_date=args.verified_report_date,
     )
 
     try:

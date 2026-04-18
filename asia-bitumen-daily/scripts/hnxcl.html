@@ -555,7 +555,22 @@
         
         .footer-right {
             display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 4px;
+        }
+
+        .footer-source-line {
+            display: flex;
             align-items: center;
+        }
+
+        .footer-note {
+            max-width: 460px;
+            text-transform: none;
+            letter-spacing: 0;
+            text-align: right;
+            line-height: 1.4;
         }
         
         .footer-square {
@@ -650,7 +665,8 @@
         <div class="footer">
             <div></div>
             <div class="footer-right">
-                数据来源: {{ARGUS_SOURCE_FILE}} <div class="footer-square"></div>
+                <div class="footer-source-line">数据来源: {{ARGUS_SOURCE_FILE}} <div class="footer-square"></div></div>
+                <div class="footer-note">{{ARGUS_SOURCE_DATE_NOTE}}</div>
             </div>
         </div>
         

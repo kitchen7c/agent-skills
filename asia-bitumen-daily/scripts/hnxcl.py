@@ -159,11 +159,14 @@ def filename_matches_target_date(filename, target_yyyymmdd):
 def argus_expected_report_date(reference_dt=None):
     """Argus 日报日期规则：
     - 周一下载对应上周五
+    - 周六、周日下载对应上周五
     - 周二到周五下载对应前一天
     """
     dt = reference_dt or datetime.now()
     if dt.weekday() == 0:
         delta_days = 3
+    elif dt.weekday() == 6:
+        delta_days = 2
     else:
         delta_days = 1
     return (dt - timedelta(days=delta_days)).strftime("%Y%m%d")
@@ -1394,17 +1397,17 @@ def is_dingtalk_preview_image(file_name):
     return Path(file_name).suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
 
-def send_file_to_dingtalk(file_path, target_user_ids="42706"):
+def send_file_to_dingtalk(file_path, target_user_ids=None):
     """将报告产物推送到一个或多个钉钉用户；图片按可预览图片消息发送。"""
     requests = import_requests()
-    client_id = get_required_env("DINGTALK_APP_KEY")
-    client_secret = get_required_env("DINGTALK_APP_SECRET")
     user_id_list = parse_target_user_ids(target_user_ids)
     if not user_id_list:
         print("未提供有效的钉钉用户ID，跳过发送。")
         return False
 
     try:
+        client_id = get_required_env("DINGTALK_APP_KEY")
+        client_secret = get_required_env("DINGTALK_APP_SECRET")
         print(f"开始推送报告到钉钉，目标用户: {', '.join(user_id_list)}...")
         file_name = os.path.basename(file_path)
         guessed_type, _ = mimetypes.guess_type(file_name)
@@ -1484,7 +1487,7 @@ class ArgusDownloader:
     def __init__(
         self,
         headless=True,
-        target_user_id="42706",
+        target_user_id=None,
         output_dir=None,
         verified_text_path=None,
         verified_report_date=None,
@@ -2561,10 +2564,13 @@ JSON schema:
 
             print(f"-> 中文版 JPEG 生成成功，已保存至: {new_image_path}")
 
-            # 推送生成的图片给指定用户
-            delivered = send_file_to_dingtalk(str(new_image_path), self.target_user_ids)
-            if delivered is False:
-                self.add_warning("delivery", "钉钉发送未成功，但图片已生成")
+            # 仅在提供了投递目标时才尝试发送；缺少钉钉凭证时只记录 warning，不影响本地产物。
+            if self.target_user_ids:
+                delivered = send_file_to_dingtalk(str(new_image_path), self.target_user_ids)
+                if delivered is False:
+                    self.add_warning("delivery", "钉钉发送未成功，但图片已生成")
+            else:
+                print("未提供钉钉投递目标，跳过发送，仅保留本地产物。")
 
             print("=== 处理完成 ===\n")
             return new_image_path
@@ -2706,8 +2712,8 @@ def main():
     parser.add_argument(
         "--user_id",
         type=str,
-        default="42706",
-        help="指定要推送消息的钉钉用户ID，例如: 42706 (默认: 42706)",
+        default=None,
+        help="指定要推送消息的钉钉用户ID；未提供时仅生成本地报告，不发送钉钉",
     )
     parser.add_argument(
         "--output-dir",

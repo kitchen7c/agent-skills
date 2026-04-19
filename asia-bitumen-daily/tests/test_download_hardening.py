@@ -1,7 +1,9 @@
+import argparse
 import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,6 +58,20 @@ class FakePdfResponse:
 
 
 class DownloadHardeningTests(unittest.TestCase):
+    def test_argus_expected_report_date_uses_previous_friday_on_weekend(self):
+        self.assertEqual(
+            hnxcl.argus_expected_report_date(datetime(2026, 4, 18)),
+            "20260417",
+        )
+        self.assertEqual(
+            hnxcl.argus_expected_report_date(datetime(2026, 4, 19)),
+            "20260417",
+        )
+
+    def test_argus_downloader_has_no_default_dingtalk_target(self):
+        downloader = hnxcl.ArgusDownloader(target_user_id=None)
+        self.assertEqual(downloader.target_user_ids, [])
+
     def test_download_publication_pdf_falls_back_when_download_event_breaks(self):
         downloader = hnxcl.ArgusDownloader()
         expected = hnxcl.FetchResult(
@@ -415,6 +431,116 @@ class DownloadHardeningTests(unittest.TestCase):
             json.loads(send_call["json"]["msgParam"]),
             {"photoURL": "@uploaded-media-id"},
         )
+
+    def test_send_file_to_dingtalk_returns_false_without_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "report.jpg"
+            image_path.write_bytes(b"\xff\xd8fake-jpeg")
+
+            with patch.dict(os.environ, {}, clear=True):
+                delivered = hnxcl.send_file_to_dingtalk(str(image_path), "42706")
+
+        self.assertFalse(delivered)
+
+    def test_generate_report_skips_delivery_when_no_target_user(self):
+        downloader = hnxcl.ArgusDownloader(target_user_id=None)
+        fetch_result = hnxcl.FetchResult(
+            source_type="argus_pdf",
+            source_name="Argus Asia Bitumen Daily (20260417).pdf",
+            source_report_date="2026年04月17日",
+            pdf_path=Path("/tmp/source.pdf"),
+            artifact_path=Path("/tmp/source.pdf"),
+        )
+        html_template = "<html><body><div id='report-container'>{{ARGUS_SOURCE_DATE_NOTE}}</div></body></html>"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            downloader.get_target_dir = lambda: Path(tmpdir)
+            with patch.dict(
+                os.environ,
+                {
+                    "LLM_API_KEY": "key",
+                    "LLM_BASE_URL": "https://example.com/v1",
+                },
+            ), patch.object(
+                hnxcl,
+                "import_openai_client",
+                return_value=lambda **kwargs: type(
+                    "Client",
+                    (),
+                    {
+                        "chat": type(
+                            "Chat",
+                            (),
+                            {
+                                "completions": type(
+                                    "Completions",
+                                    (),
+                                    {
+                                        "create": staticmethod(
+                                            lambda **kwargs: type(
+                                                "Resp",
+                                                (),
+                                                {
+                                                    "choices": [
+                                                        type(
+                                                            "Choice",
+                                                            (),
+                                                            {
+                                                                "message": type(
+                                                                    "Message",
+                                                                    (),
+                                                                    {
+                                                                        "content": json.dumps(
+                                                                            {
+                                                                                "report_date": "2026年04月19日",
+                                                                                "market_summary": ["-"],
+                                                                                "trade_dynamics": ["-"],
+                                                                                "news": [
+                                                                                    {"tag": "-", "title": "-", "desc": "-", "accent": "red"},
+                                                                                    {"tag": "-", "title": "-", "desc": "-", "accent": "orange"},
+                                                                                    {"tag": "-", "title": "-", "desc": "-", "accent": "blue"},
+                                                                                ],
+                                                                                "advice": [{"title": "-", "desc": "-"}] * 3,
+                                                                                "warnings": [{"title": "-", "desc": "-"}] * 3,
+                                                                                "forecasts": [
+                                                                                    {"title": "-", "price_range": "-", "support": "-", "resistance": "-"}
+                                                                                ] * 3,
+                                                                                "chart": {"items": []},
+                                                                            }
+                                                                        )
+                                                                    },
+                                                                )()
+                                                            },
+                                                        )()
+                                                    ]
+                                                },
+                                            )()
+                                        )
+                                    },
+                                )()
+                            },
+                        )()
+                    },
+                ),
+            ), patch("builtins.open", unittest.mock.mock_open(read_data=html_template)), patch.object(
+                hnxcl,
+                "render_report_template",
+                return_value=html_template,
+            ), patch.object(
+                hnxcl,
+                "render_html_image_via_agent_browser",
+                side_effect=lambda runner, html_path, output_image_path, session_name: (
+                    Path(output_image_path).write_bytes(b"\xff\xd8fake-jpeg"),
+                    {"imageSize": {"width": "980px", "height": "1880px"}},
+                )[1],
+            ), patch.object(
+                hnxcl,
+                "send_file_to_dingtalk",
+                side_effect=AssertionError("delivery should be skipped when no target user is configured"),
+            ):
+                result = downloader.generate_chinese_report_from_text("source text", None, fetch_result)
+
+        self.assertTrue(str(result).endswith("_zh.jpg"))
 
 
 if __name__ == "__main__":

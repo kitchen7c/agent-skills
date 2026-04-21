@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+import requests
 
 from scripts import hnxcl
 
@@ -55,6 +56,21 @@ class FakePdfResponse:
 
     def body(self):
         return self._body
+
+
+class FakeHttpResponse:
+    def __init__(self, status_code=200, url="", headers=None, content=b"", text=""):
+        self.status_code = status_code
+        self.url = url
+        self.headers = headers or {}
+        self.content = content
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            error = requests.HTTPError(f"{self.status_code} Error")
+            error.response = self
+            raise error
 
 
 class DownloadHardeningTests(unittest.TestCase):
@@ -174,6 +190,30 @@ class DownloadHardeningTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "direct-api")
         self.assertEqual(calls[0][1], "20260417")
         self.assertIn("agent-browser eval --stdin failed", calls[0][2])
+
+    def test_direct_api_401_is_reported_as_login_failure(self):
+        downloader = hnxcl.ArgusDownloader()
+
+        class FakeSession:
+            def post(self, url, data=None, headers=None, timeout=None):
+                return FakeHttpResponse(
+                    status_code=401,
+                    url="https://direct.argusmedia.com/workspaces/api/publication",
+                    headers={"content-type": "application/json"},
+                    text='{"message":"Unauthorized"}',
+                )
+
+        downloader._build_requests_session_from_agent_browser = lambda: FakeSession()
+
+        with self.assertRaises(hnxcl.ArgusStageError) as ctx:
+            downloader._fetch_publication_pdf_via_direct_api(
+                "20260417",
+                fallback_reason="agent-browser authenticated session",
+            )
+
+        self.assertEqual(ctx.exception.stage, "login")
+        self.assertIn("401", str(ctx.exception))
+        self.assertIn("Unauthorized", str(ctx.exception))
 
     def test_agent_browser_download_uses_direct_api_when_legacy_iframe_is_blank(self):
         downloader = hnxcl.ArgusDownloader()

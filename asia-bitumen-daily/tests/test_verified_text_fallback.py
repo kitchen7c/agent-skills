@@ -78,6 +78,40 @@ class VerifiedTextFallbackTests(unittest.TestCase):
         self.assertEqual(ctx.exception.stage, "publications_download")
         self.assertIn("未获取到可用的 Argus 源内容", str(ctx.exception))
 
+    def test_get_asia_bitumen_daily_stops_immediately_on_login_failure(self):
+        downloader = hnxcl.ArgusDownloader(
+            verified_text_path="/tmp/verified.txt",
+            verified_report_date="2026-04-14",
+        )
+        capture_calls = []
+        article_calls = []
+        http_calls = []
+        verified_calls = []
+
+        downloader.download_publication_pdf = lambda target_date: (_ for _ in ()).throw(
+            hnxcl.ArgusStageError("login", "Argus publication API 返回 401 Unauthorized")
+        )
+        downloader.capture_debug_artifacts = lambda stage, error: capture_calls.append((stage, error))
+        downloader.fetch_article_fallback = lambda target_date, fallback_reason: article_calls.append(
+            (target_date, fallback_reason)
+        )
+        downloader.fetch_publication_pdf_via_http_fallback = lambda target_date, fallback_reason: http_calls.append(
+            (target_date, fallback_reason)
+        )
+        downloader.load_explicit_verified_text_fallback = lambda fallback_reason: verified_calls.append(
+            fallback_reason
+        )
+
+        with self.assertRaises(hnxcl.ArgusStageError) as ctx:
+            downloader.get_asia_bitumen_daily()
+
+        self.assertEqual(ctx.exception.stage, "login")
+        self.assertIn("401 Unauthorized", str(ctx.exception))
+        self.assertEqual(len(capture_calls), 1)
+        self.assertEqual(article_calls, [])
+        self.assertEqual(http_calls, [])
+        self.assertEqual(verified_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

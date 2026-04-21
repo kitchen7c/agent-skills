@@ -1759,6 +1759,43 @@ class ArgusDownloader:
             fallback_reason=fallback_reason,
         )
 
+    def _response_text_for_auth_probe(self, response):
+        text = getattr(response, "text", "") or ""
+        if isinstance(text, bytes):
+            return text.decode("utf-8", errors="ignore")
+        return str(text)
+
+    def _response_indicates_auth_failure(self, response):
+        if response is None:
+            return False
+
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 403}:
+            return True
+
+        final_url = str(getattr(response, "url", "") or "")
+        if self._agent_browser_is_login_url(final_url):
+            return True
+
+        text = self._response_text_for_auth_probe(response).lower()
+        return any(token in text for token in ("unauthorized", "sign in", "my account"))
+
+    def _build_auth_failure_message(self, response, context):
+        status_code = getattr(response, "status_code", None)
+        final_url = str(getattr(response, "url", "") or "") or self.publication_entrypoint_url()
+        if status_code == 401:
+            status_label = "Unauthorized"
+        elif status_code == 403:
+            status_label = "Forbidden"
+        elif self._agent_browser_is_login_url(final_url):
+            status_label = "login page"
+        else:
+            status_label = "authentication shell"
+
+        if status_code:
+            return f"Argus 认证失败: {context} 返回 {status_code} {status_label} ({final_url})"
+        return f"Argus 认证失败: {context} 命中 {status_label} ({final_url})"
+
     def _fetch_pdf_from_candidate_urls(self, candidate_urls, target_date, stage, fallback_reason=None):
         session = self._build_requests_session_from_agent_browser()
         attempted = set()
@@ -2072,6 +2109,11 @@ class ArgusDownloader:
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
+        if self._response_indicates_auth_failure(response):
+            raise ArgusStageError(
+                "login",
+                self._build_auth_failure_message(response, "publication API"),
+            )
         response.raise_for_status()
         result = self._build_pdf_fetch_result_from_http_response(
             response,
@@ -2095,6 +2137,13 @@ class ArgusDownloader:
             return self._fetch_publication_pdf_via_direct_api(
                 target_date,
                 fallback_reason="agent-browser authenticated session",
+            )
+        except ArgusStageError as exc:
+            if exc.stage == "login":
+                raise
+            self.add_warning(
+                "publications_download",
+                f"direct publication API 失败，回退到 legacy UI: {exc}",
             )
         except Exception as exc:
             self.add_warning(
@@ -2136,6 +2185,11 @@ class ArgusDownloader:
             data=request_body,
             timeout=30,
         )
+        if self._response_indicates_auth_failure(response):
+            raise ArgusStageError(
+                "login",
+                self._build_auth_failure_message(response, "agent-browser publication API"),
+            )
         response.raise_for_status()
         result = self._build_pdf_fetch_result_from_http_response(
             response,
@@ -2175,6 +2229,12 @@ class ArgusDownloader:
             content_type = (response.headers.get("content-type") or "").lower()
             body = response.content or b""
 
+            if self._response_indicates_auth_failure(response):
+                raise ArgusStageError(
+                    "login",
+                    self._build_auth_failure_message(response, "HTTP publication fallback"),
+                )
+
             if "application/pdf" in content_type or body.startswith(b"%PDF-"):
                 file_name = (
                     Path(urlparse(final_url).path).name
@@ -2201,7 +2261,7 @@ class ArgusDownloader:
 
             html_text = response.text or ""
             lowered = html_text.lower()
-            if any(token in lowered for token in ("my account", "sign in", "chrome-error")):
+            if "chrome-error" in lowered:
                 self.add_warning(
                     "article_fallback",
                     f"HTTP 回退命中认证/壳页面: {final_url}",
@@ -2220,6 +2280,26 @@ class ArgusDownloader:
     def download_publication_pdf(self, target_date):
         try:
             return self._download_publication_pdf_via_agent_browser(target_date)
+        except ArgusStageError as exc:
+            if exc.stage == "login":
+                raise
+            self.add_warning("publications_download", f"agent-browser 精确路径失败，先回退到 direct API: {exc}")
+            try:
+                return self._fetch_publication_pdf_via_direct_api(
+                    target_date,
+                    fallback_reason=f"agent-browser direct path failed: {exc}",
+                )
+            except ArgusStageError as direct_api_exc:
+                if direct_api_exc.stage == "login":
+                    raise
+                self.add_warning(
+                    "publications_download",
+                    f"direct publication API 回退失败，继续回退到 HTTP: {direct_api_exc}",
+                )
+            return self.fetch_publication_pdf_via_http_fallback(
+                target_date,
+                fallback_reason=f"agent-browser direct path failed: {exc}",
+            )
         except Exception as exc:
             self.add_warning("publications_download", f"agent-browser 精确路径失败，先回退到 direct API: {exc}")
             try:
@@ -2292,6 +2372,8 @@ class ArgusDownloader:
             primary_error = str(exc)
             self.add_warning("publications_download", primary_error)
             self.capture_debug_artifacts("publications_download", primary_error)
+            if isinstance(exc, ArgusStageError) and exc.stage == "login":
+                raise
 
         if fetch_result is None:
             try:

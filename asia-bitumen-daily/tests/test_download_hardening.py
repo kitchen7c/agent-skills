@@ -275,11 +275,12 @@ class DownloadHardeningTests(unittest.TestCase):
         )
 
     def test_build_agent_browser_command_includes_session_and_executable(self):
-        downloader = hnxcl.ArgusDownloader()
-        downloader.agent_browser_executable_path = "/tmp/fake-browser"
-        downloader.agent_browser_session = "argus-session"
+        with patch.dict(os.environ, {}, clear=True):
+            downloader = hnxcl.ArgusDownloader()
+            downloader.agent_browser_executable_path = "/tmp/fake-browser"
+            downloader.agent_browser_session = "argus-session"
 
-        command = downloader._build_agent_browser_command(["open", "https://example.com"], json_output=True)
+            command = downloader._build_agent_browser_command(["open", "https://example.com"], json_output=True)
 
         self.assertEqual(
             command,
@@ -294,6 +295,112 @@ class DownloadHardeningTests(unittest.TestCase):
                 "https://example.com",
             ],
         )
+
+    def test_build_agent_browser_command_includes_explicit_proxy_settings(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_BROWSER_PROXY": "http://lowercase-proxy:8080",
+                "NO_PROXY": "localhost,127.0.0.1,.internal",
+            },
+            clear=True,
+        ):
+            downloader = hnxcl.ArgusDownloader()
+            downloader.agent_browser_executable_path = None
+
+        command = downloader._build_agent_browser_command(
+            ["open", "https://example.com"],
+            json_output=True,
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "agent-browser",
+                "--session",
+                downloader.agent_browser_session,
+                "--proxy",
+                "http://lowercase-proxy:8080",
+                "--proxy-bypass",
+                "localhost,127.0.0.1,.internal",
+                "--json",
+                "open",
+                "https://example.com",
+            ],
+        )
+
+    def test_resolved_proxy_settings_builds_normalized_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_BROWSER_PROXY": "socks5://127.0.0.1:1080",
+                "AGENT_BROWSER_PROXY_BYPASS": "localhost,.internal",
+            },
+            clear=True,
+        ):
+            settings = hnxcl.resolve_proxy_settings()
+            normalized = settings.build_environment({})
+
+        self.assertEqual(normalized["AGENT_BROWSER_PROXY"], "socks5://127.0.0.1:1080")
+        self.assertEqual(normalized["HTTP_PROXY"], "socks5://127.0.0.1:1080")
+        self.assertEqual(normalized["HTTPS_PROXY"], "socks5://127.0.0.1:1080")
+        self.assertEqual(normalized["ALL_PROXY"], "socks5://127.0.0.1:1080")
+        self.assertEqual(normalized["NO_PROXY"], "localhost,.internal")
+        self.assertEqual(normalized["no_proxy"], "localhost,.internal")
+
+    def test_resolve_proxy_settings_prefers_explicit_agent_browser_proxy(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_BROWSER_PROXY": "socks5://127.0.0.1:1080",
+                "HTTPS_PROXY": "http://ignored-proxy:8080",
+                "AGENT_BROWSER_PROXY_BYPASS": "localhost,example.internal",
+                "NO_PROXY": "ignored.local",
+            },
+            clear=True,
+        ):
+            settings = hnxcl.resolve_proxy_settings()
+
+        self.assertEqual(settings.proxy, "socks5://127.0.0.1:1080")
+        self.assertEqual(settings.proxy_bypass, "localhost,example.internal")
+
+    def test_resolve_proxy_settings_keeps_all_proxy_when_no_explicit_agent_browser_proxy(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HTTPS_PROXY": "http://corp-proxy:8080",
+                "ALL_PROXY": "socks5://127.0.0.1:1080",
+                "NO_PROXY": "localhost",
+            },
+            clear=True,
+        ):
+            settings = hnxcl.resolve_proxy_settings()
+
+        self.assertIsNone(settings.proxy)
+        self.assertEqual(settings.proxy_bypass, "localhost")
+
+    def test_apply_proxy_environment_clears_stale_proxy_variables_when_proxy_is_unset(self):
+        with patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://stale-proxy:8080",
+                "HTTPS_PROXY": "http://stale-proxy:8080",
+                "ALL_PROXY": "socks5://stale-proxy:1080",
+                "NO_PROXY": "stale.internal",
+            },
+            clear=True,
+        ):
+            previous = hnxcl.apply_proxy_environment(
+                hnxcl.ProxySettings(proxy=None, proxy_bypass="localhost,.internal")
+            )
+            current = {key: os.environ.get(key) for key in previous}
+            hnxcl.restore_proxy_environment(previous)
+
+        self.assertIsNone(current["HTTP_PROXY"])
+        self.assertIsNone(current["HTTPS_PROXY"])
+        self.assertIsNone(current["ALL_PROXY"])
+        self.assertEqual(current["NO_PROXY"], "localhost,.internal")
+        self.assertEqual(current["no_proxy"], "localhost,.internal")
 
     def test_agent_browser_login_uses_url_probe_when_state_eval_breaks(self):
         downloader = hnxcl.ArgusDownloader()

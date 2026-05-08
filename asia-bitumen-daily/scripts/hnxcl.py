@@ -272,10 +272,104 @@ class FetchResult:
     fallback_reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ProxySettings:
+    proxy: Optional[str] = None
+    proxy_bypass: Optional[str] = None
+
+    def build_environment(self, base_env=None):
+        env = dict(base_env or os.environ)
+        managed_proxy_keys = (
+            "AGENT_BROWSER_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+        managed_bypass_keys = (
+            "AGENT_BROWSER_PROXY_BYPASS",
+            "NO_PROXY",
+            "no_proxy",
+        )
+
+        if self.proxy:
+            for key in managed_proxy_keys:
+                env[key] = self.proxy
+        else:
+            for key in managed_proxy_keys:
+                env.pop(key, None)
+
+        if self.proxy_bypass:
+            for key in managed_bypass_keys:
+                env[key] = self.proxy_bypass
+        else:
+            for key in managed_bypass_keys:
+                env.pop(key, None)
+
+        return env
+
+
 class ArgusStageError(RuntimeError):
     def __init__(self, stage, message):
         super().__init__(message)
         self.stage = stage
+
+
+def first_env_value(*names):
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            stripped = value.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def resolve_proxy_settings():
+    proxy = first_env_value(
+        "AGENT_BROWSER_PROXY",
+    )
+    proxy_bypass = first_env_value(
+        "AGENT_BROWSER_PROXY_BYPASS",
+        "NO_PROXY",
+        "no_proxy",
+    )
+    return ProxySettings(proxy=proxy, proxy_bypass=proxy_bypass)
+
+
+def apply_proxy_environment(proxy_settings):
+    managed_keys = {
+        "AGENT_BROWSER_PROXY",
+        "AGENT_BROWSER_PROXY_BYPASS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+    previous = {key: os.environ.get(key) for key in managed_keys}
+    normalized = proxy_settings.build_environment({})
+
+    for key in managed_keys:
+        if key in normalized:
+            os.environ[key] = normalized[key]
+        else:
+            os.environ.pop(key, None)
+
+    return previous
+
+
+def restore_proxy_environment(previous):
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def load_verified_text_fallback(
@@ -1400,12 +1494,16 @@ def is_dingtalk_preview_image(file_name):
 def send_file_to_dingtalk(file_path, target_user_ids=None):
     """将报告产物推送到一个或多个钉钉用户；图片按可预览图片消息发送。"""
     requests = import_requests()
+    proxy_settings = resolve_proxy_settings()
+    previous_proxy_env = {}
     user_id_list = parse_target_user_ids(target_user_ids)
     if not user_id_list:
         print("未提供有效的钉钉用户ID，跳过发送。")
         return False
 
     try:
+        previous_proxy_env = apply_proxy_environment(proxy_settings)
+
         client_id = get_required_env("DINGTALK_APP_KEY")
         client_secret = get_required_env("DINGTALK_APP_SECRET")
         print(f"开始推送报告到钉钉，目标用户: {', '.join(user_id_list)}...")
@@ -1481,6 +1579,8 @@ def send_file_to_dingtalk(file_path, target_user_ids=None):
     except Exception as e:
         print(f"推送报告到钉钉时发生错误: {e}")
         return False
+    finally:
+        restore_proxy_environment(previous_proxy_env)
 
 
 class ArgusDownloader:
@@ -1516,6 +1616,7 @@ class ArgusDownloader:
         self.agent_browser_session = (
             f"argus-publication-{self.publication_id}-{uuid.uuid4().hex[:8]}"
         )
+        self.proxy_settings = resolve_proxy_settings()
 
     def publication_entrypoint_url(self):
         return f"https://direct.argusmedia.com/publication?publicationId={self.publication_id}"
@@ -1535,6 +1636,10 @@ class ArgusDownloader:
         if self.agent_browser_executable_path:
             command.extend(["--executable-path", self.agent_browser_executable_path])
         command.extend(["--session", session or self.agent_browser_session])
+        if self.proxy_settings.proxy:
+            command.extend(["--proxy", self.proxy_settings.proxy])
+        if self.proxy_settings.proxy_bypass:
+            command.extend(["--proxy-bypass", self.proxy_settings.proxy_bypass])
         if allow_file_access:
             command.append("--allow-file-access")
         if full_page:
@@ -1569,6 +1674,7 @@ class ArgusDownloader:
             text=True,
             input=stdin_text,
             timeout=timeout,
+            env=self.proxy_settings.build_environment(),
         )
         stdout = completed.stdout.strip()
         if not json_output:
@@ -2074,6 +2180,7 @@ class ArgusDownloader:
     def _build_requests_session_from_agent_browser(self):
         requests = import_requests()
         session = requests.Session()
+        session.trust_env = True
         cookies_payload = self.run_agent_browser(["cookies", "get"], json_output=True, timeout=30) or {}
         cookies = cookies_payload.get("cookies", []) if isinstance(cookies_payload, dict) else cookies_payload
         for cookie in cookies or []:
@@ -2479,8 +2586,10 @@ class ArgusDownloader:
         api_key = get_required_env("LLM_API_KEY")
         base_url = get_required_env("LLM_BASE_URL")
         model_name = os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite-preview")
+        previous_proxy_env = {}
 
         try:
+            previous_proxy_env = apply_proxy_environment(self.proxy_settings)
             OpenAI = import_openai_client()
             client = OpenAI(api_key=api_key, base_url=base_url)
 
@@ -2659,6 +2768,8 @@ JSON schema:
 
         except Exception as e:
             raise ArgusStageError("report_generation", f"大模型调用或图片生成过程中发生错误: {e}") from e
+        finally:
+            restore_proxy_environment(previous_proxy_env)
 
     def get_prices_data(self):
         """获取首页 Prices 模块的表格数据"""
